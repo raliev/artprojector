@@ -5,8 +5,8 @@ the tool figures out the perspective of the canvas from a printed calibration
 target and can rectify the view or overlay a reference image (as contours or as
 a semi-transparent picture) aligned to the canvas plane.
 
-The camera usually sees only part of the canvas. A sheet with a grid of six
-64 mm squares is placed flush with the right and bottom edges of the canvas.
+The camera may sees only part of the canvas. A sheet with a grid of six
+64 mm squares is placed flush with the right and bottom edges of the canvas to calibrate.
 From the squares the tool computes a homography between the image and the
 canvas plane (in millimeters), which is enough to rectify what the camera sees
 and to project a reference onto it.
@@ -15,10 +15,6 @@ and to project a reference onto it.
 
 - Python 3, `numpy`, `opencv-python` (developed with OpenCV 4.13)
 - A USB camera. Development used a GXI-IMX179 board camera on macOS.
-
-```
-conda activate p3124
-```
 
 ## Calibration target
 
