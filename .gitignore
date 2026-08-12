@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Generated data / calibration
+*.npz
+ref/
+
+# Images (reference photos, captures, generated templates) - keep the
+# calibration target only
+*.png
+*.jpg
+*.jpeg
+!calibr-1216.png
