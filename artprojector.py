@@ -5,8 +5,8 @@ artprojector.py
 ===============
 
 Calibrate and rectify the perspective of a canvas using a target of six
-64 mm squares printed on an 8.5x11" sheet that sits flush with the right
-and bottom edges of a 12x16" canvas.
+~63 mm squares (calibr.svg) printed on an 8.5x11" sheet that sits flush with
+the right and bottom edges of a 12x16" canvas.
 
 Modes:
   calibrate  - find the corners of the visible squares and compute the
@@ -20,7 +20,14 @@ Usage:
   conda activate p3124
   python artprojector.py calibrate           # calibration
   python artprojector.py run                 # live rectification
-  python artprojector.py list                # list cameras/resolutions
+  python artprojector.py list                # list cameras and monitors
+
+  --fullscreen --display DP-1                # where the window opens
+  --no-keep-awake                            # let the machine sleep
+
+While a session runs, sleep and the screensaver are held off two ways at once
+(a systemd-inhibit/caffeinate child, plus a poke every 45 s) - a suspend would
+re-enumerate the camera, and the camera must not move.
 
 In the calibrate window:
   col_off / row_off trackbars - shift the visible block over the 3x2 grid
@@ -28,6 +35,8 @@ In the calibrate window:
   1/2, 3/4 - tune the radial distortion k1 / k2 by hand
   5/6 - halve / double the tuning step;  0 - reset the distortion
   f  - switch the homography fit: consensus quad <-> individual corners
+  e  - toggle the sub-pixel snap of the fit onto the printed lines
+  r  - let the snap retune k1/k2 as well
   c  - compute and save the homography (+ the distortion)
   q / ESC - quit
 
@@ -39,7 +48,13 @@ In the run window:
 
 import argparse
 import os
+import platform
+import re
+import shutil
+import subprocess
 import sys
+import threading
+import time
 import numpy as np
 import cv2
 
@@ -54,23 +69,247 @@ CANVAS_H_IN = 16.0                 # canvas height, inches
 CANVAS_W = CANVAS_W_IN * MM_PER_IN   # 304.8 mm
 CANVAS_H = CANVAS_H_IN * MM_PER_IN   # 406.4 mm
 
-SQUARE_MM = 64.0                   # square side
 COLS = 3                           # squares horizontally
 ROWS = 2                           # squares vertically
 
-# Gap between adjacent squares (white spacing).
-# Center-to-center pitch = SQUARE_MM + GAP.
-# From the photo: horizontally the squares TOUCH (3*64=192 mm exactly) -> GAP_X=0.
-# Vertically there is a small gap between rows -> MEASURE it and set GAP_Y.
-GAP_X_MM = 0.0
-GAP_Y_MM = 0.6   # measured: white gap between rows is 0.6 mm (nearly touching)
+# --------------------------------------------------------------------------
+# THE PRINTED TARGET - taken verbatim from calibr.svg.
+#
+# The SVG is an A4 page with 1 user unit = 1 mm, so its numbers ARE the
+# millimeters on the paper (printed at 100%, "actual size" - see below). The
+# six rectangles were placed by hand in Inkscape and are NOT on an exact grid:
+# the column pitch is 64.407 and 64.681 mm, the rows are 64.333 mm apart, and
+# the tops of the three squares in a row differ by up to 0.22 mm. So the real
+# coordinates are used as they are instead of a nominal side + pitch, which is
+# what "64 mm squares, touching, 0.6 mm between rows" used to assume - that
+# model was ~1.1 mm too tall over the block and its width was right by luck.
+#
+# All numbers below are the STROKE CENTRELINE (an SVG stroke straddles the
+# rectangle path, 0.406 mm to each side), which is what detect_squares()
+# measures once it averages the outer and the inner contour of a frame.
+#
+# Sanity checks that this really is the printed sheet: the white gap left
+# between the strokes comes out at 0.62 mm horizontally and 0.54 mm vertically
+# - the ~0.6 mm that was measured off the photo - and the sheet's own bottom
+# margin, 279.4 (Letter) - 134.93 = 144.5 mm, is the 145 mm measured with a
+# ruler. Both only work if the page was printed at 100%, not fitted to Letter
+# (fit-to-page would have scaled everything by 0.9407).
+# --------------------------------------------------------------------------
+SQUARE_MM = 62.977863              # rectangle side, stroke centreline
+STROKE_MM = 0.811876               # printed line width
 
-# Anchoring to the canvas edges (= sheet edges, since the sheet is flush right/bottom):
-RIGHT_MARGIN_MM = 14.0             # from the canvas right edge to the right edge of the RIGHTMOST square
-BOTTOM_MARGIN_MM = 145.0           # from the canvas bottom edge to the bottom edge of the BOTTOMMOST square
+# top-left corner of each rectangle in SVG page mm, keyed (col, row)
+SHEET_RECTS_MM = {
+    (0, 0): (7.7011156, 6.9964180),
+    (1, 0): (72.107773, 7.0334225),
+    (2, 0): (136.78879, 7.2159476),
+    (0, 1): (7.6948276, 71.329369),
+    (1, 1): (72.101486, 71.366371),
+    (2, 1): (136.78250, 71.548897),
+}
 
-PITCH_X = SQUARE_MM + GAP_X_MM
-PITCH_Y = SQUARE_MM + GAP_Y_MM
+# Anchoring to the canvas edges (= sheet edges, since the sheet is flush
+# right/bottom). Measured with a ruler to the OUTER edge of the black line;
+# build_model() takes off half a stroke to get to the centreline. An error
+# here is a pure translation of everything - fix it once with w/a/s/d in
+# overlay and save with 'p'.
+RIGHT_MARGIN_MM = 14.0             # canvas right edge -> right line of the RIGHTMOST square
+BOTTOM_MARGIN_MM = 145.0           # canvas bottom edge -> bottom line of the BOTTOM square
+
+# ==========================================================================
+#  KEEPING THE MACHINE AWAKE
+#
+#  A painting session is hours of looking at the screen and not touching the
+#  keyboard, which is exactly what every idle timer is built to punish. Worse,
+#  a suspend is not merely annoying here: the camera must not move between
+#  calibrate and overlay, and coming back from sleep usually means the USB
+#  camera is re-enumerated and the stream has to be reopened.
+#
+#  Two independent mechanisms run at once, because they fail in different
+#  ways. The inhibitor is the correct one - it tells the session manager not
+#  to sleep, and it holds for as long as the child process is alive - but it
+#  depends on logind (or macOS) being there and on the desktop honouring it,
+#  and a lock screen may come up regardless. The poke is the crude one: every
+#  45 seconds it tells the screensaver that somebody is still here. Neither is
+#  reliable across every desktop; both failing at once is unlikely.
+#
+#  Everything is best-effort and silent: a machine that cannot be kept awake
+#  is not a reason to refuse to run.
+# ==========================================================================
+KEEP_AWAKE = True
+_POKE_PERIOD_S = 45.0
+
+
+class KeepAwake:
+    """Hold off sleep and the screensaver for as long as this is alive."""
+
+    def __init__(self, why="artprojector session"):
+        self.why = why
+        self._proc = None
+        self._stop = threading.Event()
+        self._thread = None
+        self._poke = None          # the poke command that worked, if any
+
+    # -- mechanism 1: a held inhibitor ------------------------------------
+    def _inhibitor_cmd(self):
+        if platform.system() == "Darwin":
+            # -dimsu: display, idle, disk, system; -w dies with us
+            return ["caffeinate", "-dimsu", "-w", str(os.getpid())]
+        return ["systemd-inhibit", "--what=idle:sleep:handle-lid-switch",
+                "--who=artprojector", f"--why={self.why}", "--mode=block",
+                "sleep", "infinity"]
+
+    # -- mechanism 2: periodic "somebody is still here" -------------------
+    def _poke_cmds(self):
+        if platform.system() == "Darwin":
+            return [["caffeinate", "-u", "-t", "5"]]
+        return [
+            # freedesktop, spoken by both KDE and GNOME
+            ["gdbus", "call", "--session", "--dest", "org.freedesktop.ScreenSaver",
+             "--object-path", "/org/freedesktop/ScreenSaver",
+             "--method", "org.freedesktop.ScreenSaver.SimulateUserActivity"],
+            ["xdg-screensaver", "reset"],
+            ["xset", "s", "reset"],
+        ]
+
+    def _run(self, cmd):
+        try:
+            return subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL,
+                                  timeout=10).returncode == 0
+        except Exception:
+            return False
+
+    def _loop(self):
+        while not self._stop.wait(_POKE_PERIOD_S):
+            if self._poke and not self._run(self._poke):
+                self._poke = None          # it stopped working - stop trying
+            if self._poke is None:
+                break
+
+    def start(self):
+        cmd = self._inhibitor_cmd()
+        if shutil.which(cmd[0]):
+            try:
+                self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                              stderr=subprocess.DEVNULL)
+            except Exception:
+                self._proc = None
+        for c in self._poke_cmds():
+            if shutil.which(c[0]) and self._run(c):
+                self._poke = c
+                break
+        if self._poke:
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+        held = ", ".join(
+            n for n, ok in (("inhibitor", self._proc is not None),
+                            (f"poke ({self._poke[0]})" if self._poke else "poke",
+                             self._poke is not None)) if ok)
+        print(f"[awake] {held or 'nothing worked - the machine may still sleep'}")
+        return self
+
+    def stop(self):
+        self._stop.set()
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=3)
+            except Exception:
+                pass
+            self._proc = None
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
+
+
+# ==========================================================================
+#  DISPLAYS AND WINDOW PLACEMENT
+# ==========================================================================
+FULLSCREEN = False
+DISPLAY_TARGET = None              # monitor index or name to open windows on
+
+
+def list_displays():
+    """[(name, x, y, w, h)] for the monitors, as the WINDOWS see them.
+
+    xrandr comes first on purpose. An OpenCV window is a Qt window on an X11
+    screen - XWayland included - so it is xrandr's idea of where the monitors
+    are that decides where cv2.moveWindow() actually puts things, even when
+    the session is Wayland and the compositor's own layout says otherwise.
+    kscreen-doctor is only a fallback for naming them.
+
+    Note that under XWayland a mirrored pair reports both monitors at +0+0,
+    and then no coordinate can tell them apart - `--display` cannot help there
+    and the window will land on whichever one the compositor picks."""
+    try:
+        out = subprocess.run(["xrandr", "--listmonitors"], timeout=5,
+                             capture_output=True, text=True).stdout
+        mons = []
+        for ln in out.splitlines()[1:]:
+            m = re.search(r"(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)\s+(\S+)", ln)
+            if m:
+                w, h, x, y, name = m.groups()
+                mons.append((name, int(x), int(y), int(w), int(h)))
+        if mons:
+            return mons
+    except Exception:
+        pass
+    try:
+        from screeninfo import get_monitors
+        return [(m.name or f"display{i}", m.x, m.y, m.width, m.height)
+                for i, m in enumerate(get_monitors())]
+    except Exception:
+        return []
+
+
+def _display_index(mons, target):
+    """Resolve --display (an index, or a monitor name) to a position in mons."""
+    if target is None or not mons:
+        return None
+    try:
+        i = int(target)
+        return i if 0 <= i < len(mons) else None
+    except (TypeError, ValueError):
+        pass
+    for i, (name, *_rest) in enumerate(mons):
+        if name.lower() == str(target).lower():
+            return i
+    return None
+
+
+def make_window(name, fullscreen=None, display=None):
+    """Create a resizable window, optionally on a given monitor / fullscreen.
+
+    The move has to happen before the fullscreen flag: what a window manager
+    fullscreens onto is the monitor the window is currently on."""
+    fullscreen = FULLSCREEN if fullscreen is None else fullscreen
+    display = DISPLAY_TARGET if display is None else display
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    mons = list_displays()
+    i = _display_index(mons, display)
+    if i is not None:
+        _n, x, y, w, h = mons[i]
+        try:
+            cv2.moveWindow(name, x, y)
+            cv2.resizeWindow(name, w, h)
+        except cv2.error:
+            pass
+    elif display is not None:
+        print(f"[display] no monitor '{display}' - "
+              f"{len(mons)} found; see 'artprojector.py list'")
+    if fullscreen:
+        try:
+            cv2.setWindowProperty(name, cv2.WND_PROP_FULLSCREEN,
+                                  cv2.WINDOW_FULLSCREEN)
+        except cv2.error:
+            pass
+    return name
+
 
 # ==========================================================================
 #  CAMERA / OUTPUT CONFIG
@@ -107,6 +346,7 @@ FIT_MODE = "consensus"
 # BGR - magenta, distinct from the green squares and from the red used for
 # squares that fall outside the grid
 CONSENSUS_COLOR = (255, 0, 255)
+REFINE_COLOR = (255, 255, 0)       # cyan - the refined fit, drawn over the ink
 
 
 # ==========================================================================
@@ -117,25 +357,29 @@ CONSENSUS_COLOR = (255, 0, 255)
 #  the bottom-right corner) - no need to recalibrate when the canvas size changes.
 # ==========================================================================
 def build_model():
-    """Return dict {(col,row): (4,2) float32} of corners TL,TR,BR,BL in mm."""
-    x_right_anchor = -RIGHT_MARGIN_MM                    # right edge of the right square
-    y_bottom_anchor = -BOTTOM_MARGIN_MM                  # bottom edge of the bottom square
-    l_right = x_right_anchor - SQUARE_MM                 # left edge of the right column (col=COLS-1)
-    t_bottom = y_bottom_anchor - SQUARE_MM               # top edge of the bottom row (row=ROWS-1)
+    """Return dict {(col,row): (4,2) float32} of corners TL,TR,BR,BL in mm.
+
+    The sheet layout comes from SHEET_RECTS_MM (page coordinates); it is
+    shifted so that the outermost printed lines sit at the measured margins
+    from the canvas corner."""
+    # centreline of the rightmost / bottom-most printed line, in page mm
+    right = max(x for (x, _) in SHEET_RECTS_MM.values()) + SQUARE_MM
+    bottom = max(y for (_, y) in SHEET_RECTS_MM.values()) + SQUARE_MM
+    # the margins are measured to the outer edge of that line
+    x_anchor = -(RIGHT_MARGIN_MM - STROKE_MM / 2.0)
+    y_anchor = -(BOTTOM_MARGIN_MM - STROKE_MM / 2.0)
 
     model = {}
-    for col in range(COLS):
-        x0 = l_right - (COLS - 1 - col) * PITCH_X        # left edge of column col
-        for row in range(ROWS):
-            y0 = t_bottom - (ROWS - 1 - row) * PITCH_Y   # top edge of row row
-            s = SQUARE_MM
-            corners = np.array([
-                [x0,     y0],       # TL
-                [x0 + s, y0],       # TR
-                [x0 + s, y0 + s],   # BR
-                [x0,     y0 + s],   # BL
-            ], dtype=np.float32)
-            model[(col, row)] = corners
+    s = SQUARE_MM
+    for (col, row), (px, py) in SHEET_RECTS_MM.items():
+        x0 = px - right + x_anchor                       # left line of this square
+        y0 = py - bottom + y_anchor                      # top line of this square
+        model[(col, row)] = np.array([
+            [x0,     y0],       # TL
+            [x0 + s, y0],       # TR
+            [x0 + s, y0 + s],   # BR
+            [x0,     y0 + s],   # BL
+        ], dtype=np.float32)
     return model
 
 
@@ -325,12 +569,23 @@ def order_quad(pts):
 
 
 def detect_squares(frame):
-    """Return a list of (4,2) corner arrays for the squares (TL,TR,BR,BL).
+    """Return (quads, n_paired): (4,2) corner arrays (TL,TR,BR,BL) and how
+    many of them came from a complete outer+inner contour pair.
 
     Works with OUTLINED squares (black frame on light paper): black lines ->
-    foreground, take all 4-gon contours of the right size (outer frame
-    contours AND inner grid-cell "holes"), then deduplicate by center
-    (keep the larger one = outer edge).
+    foreground, take all 4-gon contours of the right size, then group them by
+    center. Each printed frame gives TWO of them - the outside of the black
+    stroke and the hole inside it - and they are averaged into the STROKE
+    CENTRELINE.
+
+    Keeping the outer contour instead (as this used to) measures every square
+    a full stroke width too big - 0.81 mm, which is 0.4% of the block and
+    ends up as ~1 mm of drift at the far corner of the canvas. Worse, it is
+    not even a stable bias: whether the outer contour survives at all depends
+    on exposure and on whether the blur merges the strokes of neighbouring
+    squares, so the same sheet can measure 0.8 mm differently between two
+    runs. The centreline is what the SVG rectangle is and what build_model()
+    returns, and it is immune to how fat the printer laid the ink down.
     """
     h, w = frame.shape[:2]
     area_img = float(h * w)
@@ -362,16 +617,45 @@ def detect_squares(frame):
         quad = order_quad(approx)
         cand.append((area, quad, quad.mean(axis=0)))
 
-    # deduplicate by center proximity: keep the larger contour
+    if not cand:
+        return [], 0
+
+    # sub-pixel corners, per contour, BEFORE the two contours of a frame are
+    # merged (afterwards there is no image feature at the averaged corner)
+    corners = np.vstack([q for (_, q, _) in cand]).astype(np.float32)
+    cv2.cornerSubPix(
+        gray, corners, (5, 5), (-1, -1),
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.01))
+    cand = [(a, corners[i * 4:(i + 1) * 4], corners[i * 4:(i + 1) * 4].mean(axis=0))
+            for i, (a, _, _) in enumerate(cand)]
+
+    # Group by center: the outside and the hole of one frame share a center.
+    # Size has to agree too - the two sides of a stroke differ by ~2%, so a
+    # quad that is merely concentric and much bigger (the outline of the whole
+    # block, or the sheet itself) is a different object, not a partner.
     cand.sort(key=lambda t: -t[0])
-    quads, centers, areas = [], [], []
+    groups = []                        # list of [(area, quad), ...]
     for area, quad, cen in cand:
-        r = 0.45 * np.sqrt(area)
-        if any(np.linalg.norm(cen - pc) < r for pc in centers):
-            continue
-        quads.append(quad)
-        centers.append(cen)
-        areas.append(area)
+        for g in groups:
+            if (np.linalg.norm(cen - g[0][1].mean(axis=0)) < 0.45 * np.sqrt(area)
+                    and np.sqrt(area / g[0][0]) > 0.75):
+                g.append((area, quad))
+                break
+        else:
+            groups.append([(area, quad)])
+
+    quads, areas, solo = [], [], []
+    for g in groups:
+        outer, inner = g[0], g[-1]     # sorted by area, descending
+        ratio = np.sqrt(inner[0] / outer[0])
+        if len(g) >= 2 and 0.80 <= ratio < 1.0:
+            quads.append((outer[1] + inner[1]) / 2.0)   # <- the centreline
+            areas.append(0.5 * (outer[0] + inner[0]))
+            solo.append(False)
+        else:
+            quads.append(outer[1])
+            areas.append(outer[0])
+            solo.append(True)
 
     # size-consistency filter: real squares are ~equal in size, so drop
     # outliers (stray rectangles at a different scale)
@@ -379,15 +663,35 @@ def detect_squares(frame):
         med = float(np.median(areas))
         keep = [i for i, a in enumerate(areas) if 0.4 * med <= a <= 2.5 * med]
         quads = [quads[i] for i in keep]
+        areas = [areas[i] for i in keep]
+        solo = [solo[i] for i in keep]
 
-    # refine corners to sub-pixel accuracy
-    if quads:
-        corners = np.vstack(quads).astype(np.float32)
-        cv2.cornerSubPix(
-            gray, corners, (7, 7), (-1, -1),
-            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.01))
-        quads = [corners[i * 4:(i + 1) * 4] for i in range(len(quads))]
-    return quads
+    # Drop anything that swallows another square's centre. When the 0.6 mm
+    # white gap between two squares closes up - at a distance, or under blur -
+    # their strokes merge and the pair (or the whole block, or a column) traces
+    # one more rounded rectangle, which is convex, four-sided and close enough
+    # in size to survive the filters above. No printed square ever contains the
+    # centre of another one, so containment identifies those cleanly, and
+    # without them assign_local_grid() does not see a phantom extra column.
+    if len(quads) > 1:
+        cents = [q.mean(axis=0) for q in quads]
+        drop = set()
+        for i, q in enumerate(quads):
+            for j, c in enumerate(cents):
+                if i != j and cv2.pointPolygonTest(q.astype(np.float32),
+                                                   tuple(float(v) for v in c),
+                                                   False) > 0:
+                    drop.add(i)
+                    break
+        if len(drop) < len(quads):
+            keep = [i for i in range(len(quads)) if i not in drop]
+            quads = [quads[i] for i in keep]
+            solo = [solo[i] for i in keep]
+
+    # A frame whose partner contour was lost keeps half a stroke of bias; it is
+    # reported (n_paired) rather than guessed at, and refine_homography() takes
+    # it out anyway by measuring the printed lines directly.
+    return quads, sum(1 for s in solo if not s)
 
 
 def assign_local_grid(quads):
@@ -564,6 +868,15 @@ def outer_world_quad(model, bounds=None):
                      model[(cmin, rmax)][3]], np.float32)
 
 
+def draw_model(vis, H, model, color=(255, 255, 0), thickness=1):
+    """Draw the model squares projected through H (a look at the fit itself)."""
+    for corners in model.values():
+        p = np.hstack([np.asarray(corners, np.float64), np.ones((4, 1))]) @ H.T
+        p = p[:, :2] / p[:, 2:3]
+        cv2.polylines(vis, [np.round(p).astype(np.int32)], True, color,
+                      thickness, cv2.LINE_AA)
+
+
 def draw_consensus(vis, quad, lines, color=CONSENSUS_COLOR):
     """Draw the fitted lines (thin) and the consensus quad (thick)."""
     h, w = vis.shape[:2]
@@ -581,6 +894,412 @@ def draw_consensus(vis, quad, lines, color=CONSENSUS_COLOR):
                   cv2.LINE_AA)
     for p in quad:
         cv2.circle(vis, tuple(np.round(p).astype(int)), 6, color, -1)
+
+
+# ==========================================================================
+#  SUB-PIXEL REFINEMENT - "the calibration of the calibration"
+#
+#  Everything above measures the target through its CORNERS: 24 of them, and
+#  they are the worst-localised features on the sheet - a corner is where two
+#  fat printed lines meet and where the contour tracer, the blur and the
+#  sub-pixel snapper all disagree the most. The consensus quad then throws
+#  away all but four of them.
+#
+#  But the sheet knows far more about itself than that. It has 24 straight
+#  printed edges, several thousand pixels of them, and each one is a dark
+#  ridge whose centre can be found across the profile to a fraction of a
+#  pixel, far better than any endpoint. This stage uses them: project every
+#  model edge into the RAW frame with the current estimate, walk across it,
+#  find the darkest point, and solve for the homography (and optionally
+#  k1/k2) that lands the projected lines on the measured ones.
+#
+#  That also makes the result self-checking, which corner fits never were.
+#  A homography fitted to four corners always maps the model block onto the
+#  imaged block exactly, so it reports a small error even when the model
+#  geometry is wrong - the error just moves somewhere else on the canvas,
+#  where nothing is measuring it. Fitting 24 lines at once cannot be fooled
+#  that way: a model whose squares are the wrong size or pitch cannot put all
+#  of them on ink simultaneously, and the leftover residual (printed in mm)
+#  says so.
+# ==========================================================================
+REFINE_STEP_MM = 1.5       # spacing of sample points along an edge
+REFINE_TRIM_MM = 4.0       # skip this much at both ends (corners are rounded)
+REFINE_SEARCH_MM = 0.62    # how far to look across a line. MUST stay below half
+                           # the 1.355 mm gap to the neighbouring square's line
+                           # (0.68) or a sample can lock onto the wrong one, and
+                           # above half a stroke (0.41), which is how far off the
+                           # start can be when only one contour of a frame was
+                           # found
+REFINE_COARSE_MM = 3.0     # ditto for the coarse pass, which only uses the
+                           # four outer edges of the block - nothing else is
+                           # within 60 mm of them, so it can look much further
+REFINE_MIN_CONTRAST = 12.0  # gray levels between the paper and the line
+REFINE_ITERS = 6
+
+
+EDGE_NAMES = ("top", "right", "bottom", "left")
+
+
+def model_edge_samples(model, keys=None, step_mm=REFINE_STEP_MM,
+                       trim_mm=REFINE_TRIM_MM, outer_only=False,
+                       with_labels=False):
+    """Points along every printed edge, with the edge normal. Both in mm.
+
+    Returns (pts (N,2), normals (N,2)), plus a per-point (col,row,edge) label
+    list when with_labels is set. The normal points INTO the square, which
+    measure_line_offsets() relies on: that is the side with 63 mm of blank
+    paper behind it.
+
+    outer_only keeps just the four edges that bound the whole block. Those are
+    the only lines with no other line within 60 mm of them, so they can be
+    searched for from far away without any risk of locking onto a neighbour -
+    which is what the coarse pass in refine_homography() needs."""
+    keys = set(model) if keys is None else set(keys)
+    cmin = min(c for (c, _) in keys); cmax = max(c for (c, _) in keys)
+    rmin = min(r for (_, r) in keys); rmax = max(r for (_, r) in keys)
+    pts, nrm, lab = [], [], []
+    for key, c in model.items():
+        if key not in keys:
+            continue
+        col, row = key
+        # TL->TR is the top edge, TR->BR the right one, and so on
+        use = [row == rmin, col == cmax, row == rmax, col == cmin]
+        c = np.asarray(c, np.float64)
+        for i in range(4):
+            if outer_only and not use[i]:
+                continue
+            a, b = c[i], c[(i + 1) % 4]
+            L = float(np.linalg.norm(b - a))
+            if L <= 2 * trim_mm + step_mm:
+                continue
+            d = (b - a) / L
+            n = np.array([-d[1], d[0]])          # 90 deg from the edge
+            t = np.arange(trim_mm, L - trim_mm + 1e-9, step_mm)
+            pts.append(a + np.outer(t, d))
+            nrm.append(np.repeat(n[None, :], len(t), axis=0))
+            lab += [(col, row, i)] * len(t)
+    if not pts:
+        empty = (np.zeros((0, 2)), np.zeros((0, 2)))
+        return empty + ([],) if with_labels else empty
+    out = (np.vstack(pts), np.vstack(nrm))
+    return out + (lab,) if with_labels else out
+
+
+def project_raw(pts_mm, H, k1, k2, w, h):
+    """world mm -> RAW (still distorted) sensor pixels.
+
+    Refinement works on the raw frame on purpose: no resampling stands between
+    the measurement and the sensor, and k1/k2 stay ordinary parameters of the
+    projection chain instead of something baked into the image."""
+    p = np.hstack([np.asarray(pts_mm, np.float64),
+                   np.ones((len(pts_mm), 1))]) @ np.asarray(H, np.float64).T
+    p = p[:, :2] / p[:, 2:3]
+    if abs(k1) < 1e-12 and abs(k2) < 1e-12:
+        return p
+    return distort_points(p, k1, k2, w, h).astype(np.float64)
+
+
+def sample_gray(gray, pts):
+    """Bilinear sample of a gray image at float points (...,2). NaN outside."""
+    h, w = gray.shape[:2]
+    x, y = pts[..., 0], pts[..., 1]
+    ok = (x >= 0) & (x <= w - 2) & (y >= 0) & (y <= h - 2)
+    x0 = np.clip(np.floor(x), 0, w - 2).astype(np.int32)
+    y0 = np.clip(np.floor(y), 0, h - 2).astype(np.int32)
+    fx, fy = x - x0, y - y0
+    g = gray.astype(np.float32)
+    v = (g[y0, x0] * (1 - fx) * (1 - fy) + g[y0, x0 + 1] * fx * (1 - fy) +
+         g[y0 + 1, x0] * (1 - fx) * fy + g[y0 + 1, x0 + 1] * fx * fy)
+    return np.where(ok, v, np.nan)
+
+
+def measure_line_offsets(gray, pts_mm, nrm_mm, H, k1, k2,
+                         search_mm=REFINE_SEARCH_MM, ink_mm=None):
+    """How far each projected sample sits from the printed line it belongs to.
+
+    Returns (p_img (N,2), n_img (N,2), offset_px (N,), good (N,) bool), the
+    offset signed along n_img.
+
+    The line is located by its INNER FLANK - the step from the square's empty
+    interior into the ink - and not by the darkest point across it.
+
+    The darkest point is the obvious thing to look for, and it is what this did
+    first, but it does not survive contact with the sheet. Neighbouring squares
+    are 1.355 mm apart while their lines are 0.81 mm wide, so the white gap
+    between an inner pair of lines is barely half a millimetre: at the ~7 px/mm
+    a real frame gives, that is three or four pixels. Blur fills it in, each
+    line's dip gets dragged toward its neighbour, and the bottom of the merged
+    trough goes flat enough for noise to move the minimum a whole pixel between
+    adjacent samples. Measured on a real sheet, the fourteen inner edges came
+    out at 0.145 mm against 0.098 mm for the ten edges on the block outline,
+    which have no neighbour within 60 mm.
+
+    Every square is blank inside for 63 mm, so the inner flank is clean for all
+    24 edges, with no special cases. And the position of a blurred step is
+    where its gradient peaks - somewhere symmetric blur, unlike a merging
+    neighbour, does not move it. The price is that the measurement now depends
+    on how wide the printer actually laid the ink down, so refine_homography()
+    solves for that as one more unknown (info["ink_mm"])."""
+    h, w = gray.shape[:2]
+    ink = STROKE_MM / 2.0 if ink_mm is None else float(ink_mm)
+    p0 = project_raw(pts_mm, H, k1, k2, w, h)
+    # the normal in image space: where 0.5 mm along it lands. nrm_mm points
+    # INTO the square (see model_edge_samples), so +u walks off the ink into
+    # the empty interior
+    p1 = project_raw(pts_mm + nrm_mm * 0.5, H, k1, k2, w, h)
+    nv = p1 - p0
+    ln = np.linalg.norm(nv, axis=1, keepdims=True)
+    px_per_mm = np.maximum(ln / 0.5, 1e-9)                  # (N,1) local scale
+    nv = nv / np.maximum(ln, 1e-9)
+
+    # window around where the flank should be, wide enough to still find it
+    # when the start is search_mm out, and stopping short of the neighbouring
+    # square's ink (which begins 0.95 mm on the other side of the line)
+    lo, hi = ink - search_mm - 0.25, ink + search_mm + 0.25
+    n_samples = max(21, int(np.ceil((hi - lo) / 0.07)) | 1)
+    u = np.linspace(lo, hi, n_samples)[None, :]             # (1,S) mm
+    off = u * px_per_mm                                     # (N,S) px
+    prof = sample_gray(gray, p0[:, None, :] + nv[:, None, :] * off[:, :, None])
+
+    good = ~np.isnan(prof).any(axis=1)
+    prof = np.where(np.isnan(prof), 0.0, prof)
+    # brightening across the step, per sample interval
+    grad = np.diff(prof, axis=1)
+    i = np.argmax(grad, axis=1)
+    idx = np.arange(len(prof))
+    good &= (i > 0) & (i < grad.shape[1] - 1)
+    i = np.clip(i, 1, grad.shape[1] - 2)
+    y0_, y1_, y2_ = grad[idx, i - 1], grad[idx, i], grad[idx, i + 1]
+    # a real step: the ink is darker than the paper by a visible margin
+    good &= (prof.max(axis=1) - prof.min(axis=1)) > REFINE_MIN_CONTRAST
+    den = (y0_ - 2 * y1_ + y2_)
+    good &= den < -1e-9                                     # a real maximum
+    sub = np.where(np.abs(den) > 1e-9, 0.5 * (y0_ - y2_) / np.where(
+        np.abs(den) > 1e-9, den, 1.0), 0.0)
+    sub = np.clip(sub, -1.0, 1.0)
+    step = u[0, 1] - u[0, 0]
+    # gradient index i sits between samples i and i+1
+    u_flank = u[0, i] + (0.5 + sub) * step
+    return p0, nv, (u_flank - ink) * px_per_mm[:, 0], good
+
+
+def _refine_pass(gray_raw, H, k1, k2, pts, nrm, iters, search_mm, refine_dist,
+                 ink=None, refine_ink=False):
+    """One Gauss-Newton fit of H (and optionally k1/k2, and the ink width) to
+    the sampled lines. Returns (H, k1, k2, ink).
+
+    The update is parametrised as H <- H @ Minv @ (I+F) @ M with M normalising
+    the target to a unit box, so all eight entries of F are of comparable
+    weight and a plain finite-difference Gauss-Newton stays well conditioned
+    even though H itself spans six orders of magnitude. Two IRLS rounds with a
+    Huber weight keep one sample that latched onto a shadow or a pencil mark
+    from steering the fit.
+
+    `ink` is the half-width the flank measurement subtracts to get back to the
+    centre of a line. Printers do not lay ink down at exactly the width asked
+    for, and getting it wrong dilates every square about its own centre by the
+    same amount - which is not a homography, so it does not hide in H and can
+    be solved for. It is solved for jointly rather than assumed, but only when
+    several squares are in view: with one square, dilating it about its centre
+    IS a scale change, and the two become the same unknown."""
+    h, w = gray_raw.shape[:2]
+    ink = STROKE_MM / 2.0 if ink is None else float(ink)
+    cen = pts.mean(axis=0)
+    scale = float(np.max(np.linalg.norm(pts - cen, axis=1)))
+    M = np.array([[1 / scale, 0, -cen[0] / scale],
+                  [0, 1 / scale, -cen[1] / scale],
+                  [0, 0, 1.0]])
+    Minv = np.linalg.inv(M)
+    H = np.asarray(H, np.float64).copy()
+
+    n_geo = 8 + (2 if refine_dist else 0)
+    n_par = n_geo + (1 if refine_ink else 0)
+    delta = 1e-4
+
+    def perturb(j, eps):
+        """Apply a small step in parameter j -> (H, k1, k2)."""
+        if j >= 8:
+            return H, k1 + (eps if j == 8 else 0.0), k2 + (eps if j == 9 else 0.0)
+        F = np.zeros(9)
+        F[j] = eps                       # F[8] (the 3,3 entry) stays fixed
+        return H @ Minv @ (np.eye(3) + F.reshape(3, 3)) @ M, k1, k2
+
+    for _ in range(iters):
+        p0, nv, off, good = measure_line_offsets(gray_raw, pts, nrm, H, k1, k2,
+                                                 search_mm, ink)
+        if good.sum() < 12:
+            break
+        P, N, d = pts[good], nv[good], off[good]
+        J = np.empty((len(P), n_par))
+        base = project_raw(P, H, k1, k2, w, h)
+        for j in range(n_geo):
+            Hj, k1j, k2j = perturb(j, delta)
+            pj = project_raw(P, Hj, k1j, k2j, w, h)
+            J[:, j] = ((pj - base) * N).sum(axis=1) / delta   # motion along n
+        if refine_ink:
+            # widening the ink by 1 mm moves the measured centre 1 mm inwards,
+            # i.e. by the local scale in pixels
+            step_mm = project_raw(P + nrm[good] * 0.5, H, k1, k2, w, h) - base
+            J[:, n_geo] = np.linalg.norm(step_mm, axis=1) / 0.5
+        r = d.copy()
+        wgt = np.ones(len(P))
+        for _irls in range(2):
+            A = J * wgt[:, None]
+            step, *_ = np.linalg.lstsq(A, r * wgt, rcond=None)
+            res = r - J @ step
+            s = 1.4826 * np.median(np.abs(res - np.median(res))) + 1e-6
+            wgt = np.minimum(1.0, 2.0 * s / np.maximum(np.abs(res), 1e-9))
+        F = np.zeros(9)
+        F[:8] = step[:8]
+        H = H @ Minv @ (np.eye(3) + F.reshape(3, 3)) @ M
+        H = H / H[2, 2]
+        if refine_dist:
+            k1 += float(step[8]); k2 += float(step[9])
+        if refine_ink:
+            # half a printed line, between half and two and a half times the
+            # width it was drawn at - beyond that something else is wrong
+            ink = float(np.clip(ink + step[n_geo], 0.25 * STROKE_MM,
+                                1.25 * STROKE_MM))
+        if np.abs(step[:8]).max() < 1e-7:
+            break
+    return H, k1, k2, ink
+
+
+def refine_homography(gray_raw, H, model, k1=0.0, k2=0.0, keys=None,
+                      iters=REFINE_ITERS, refine_dist=False):
+    """Fit H (and optionally k1/k2) to the printed lines themselves.
+
+    gray_raw is the RAW camera frame in gray; H maps mm -> undistorted px, as
+    everywhere else. Returns (H, k1, k2, info).
+
+    Two passes, coarse to fine. The fine pass may only look 0.62 mm to each
+    side of where it expects the flank, because the neighbouring square's ink
+    starts about a millimetre past it and a sample that walks that far measures
+    the wrong line - and nothing downstream would notice, since a fit locked
+    one line over still reports a tiny residual while being a millimetre wrong
+    out on the canvas. The corner fit it starts from can easily be off by more
+    than that, so the coarse pass first lines the block up using ONLY its four
+    outer edges, which have no neighbour within 60 mm and can be searched for
+    from 3 mm away. After that every inner line is well inside its capture
+    range."""
+    h, w = gray_raw.shape[:2]
+    pts, nrm = model_edge_samples(model, keys)
+    info = {"n": 0, "n_total": len(pts), "rms_px": float("nan"),
+            "rms_mm": float("nan"), "ink_mm": STROKE_MM / 2.0, "ok": False}
+    if len(pts) < 20:
+        return H, k1, k2, info
+    H = np.asarray(H, np.float64).copy()
+    ink = STROKE_MM / 2.0
+    # see _refine_pass: with fewer squares the ink width is not separable
+    refine_ink = len(set(model) if keys is None else set(keys)) >= 3
+
+    if iters > 0:
+        o_pts, o_nrm = model_edge_samples(model, keys, outer_only=True)
+        if len(o_pts) >= 12:
+            H, k1, k2, _ = _refine_pass(gray_raw, H, k1, k2, o_pts, o_nrm,
+                                        max(2, iters // 2), REFINE_COARSE_MM,
+                                        False, ink)
+        H, k1, k2, ink = _refine_pass(gray_raw, H, k1, k2, pts, nrm, iters,
+                                      REFINE_SEARCH_MM, refine_dist,
+                                      ink, refine_ink)
+
+    p0, nv, off, good = measure_line_offsets(gray_raw, pts, nrm, H, k1, k2,
+                                             ink_mm=ink)
+    if good.sum() >= 12:
+        rms = float(np.sqrt(np.mean(off[good] ** 2)))
+        ppm = plane_px_per_mm(H, pts[good][::7])
+        info.update(n=int(good.sum()), rms_px=rms, rms_mm=rms / max(ppm, 1e-6),
+                    ink_mm=ink, ok=True)
+    return H, k1, k2, info
+
+
+def refine_report(gray_raw, H, model, k1=0.0, k2=0.0, keys=None,
+                  out_path="snap_residual.png", frame=None, ink_mm=None):
+    """Say what SHAPE the leftover snap residual has, and write a picture of it.
+
+    A residual well above the ~0.03 mm the geometry alone gives is not noise -
+    noise averages out over 900 samples - so it is worth knowing what it is
+    before chasing it. Three candidates are separable here:
+
+      * lens - the two-term radial model with the principal point pinned to the
+        centre of the frame is an approximation, and what it misses is a smooth
+        field that grows with the radius. Regressing the residual onto the
+        radial signature says how much of it that is; if it is most of it, 'r'
+        (refit k1/k2 through the lines) and re-centring the target in the frame
+        will help.
+      * paper - a sheet that is not perfectly flat breaks the one assumption
+        this whole tool rests on. Curl is smooth across the sheet, so a
+        quadratic in the sheet coordinates captures it.
+      * print - the sheet not matching calibr.svg. A uniform scale error is
+        invisible here (a homography absorbs it, which is exactly why it must
+        be checked with a ruler instead), but a non-uniform one is not: it
+        shows up as a per-edge offset pattern, so the table below is printed
+        edge by edge.
+
+    None of them can be told apart by the size of the residual alone, which is
+    why this prints the decomposition rather than a verdict."""
+    h, w = gray_raw.shape[:2]
+    pts, nrm, lab = model_edge_samples(model, keys, with_labels=True)
+    if len(pts) < 20:
+        print("[snap] not enough sample points")
+        return
+    p0, nv, off, good = measure_line_offsets(gray_raw, pts, nrm, H, k1, k2,
+                                             ink_mm=ink_mm)
+    if good.sum() < 20:
+        print("[snap] no lock")
+        return
+    P, N, D, IMG = pts[good], nv[good], off[good], p0[good]
+    ppm = plane_px_per_mm(H, P[::7])
+    mm = D / ppm                                   # residual in mm on the sheet
+    lab = [l for l, g in zip(lab, good) if g]
+    ink = STROKE_MM / 2.0 if ink_mm is None else ink_mm
+
+    print(f"[snap] {len(D)} points, rms {np.sqrt((mm ** 2).mean()):.3f} mm "
+          f"({np.sqrt((D ** 2).mean()):.2f} px), scale {ppm:.2f} px/mm, "
+          f"ink {2 * ink:.3f} mm wide (drawn {STROKE_MM:.3f})")
+
+    # --- per edge: a signed mean is a real offset, not scatter ---
+    print("       square  edge     n   mean(mm)  rms(mm)")
+    for key in sorted(set((c, r) for (c, r, _) in lab)):
+        for e in range(4):
+            m = np.array([(l[0], l[1]) == key and l[2] == e for l in lab])
+            if m.sum() < 3:
+                continue
+            print(f"       ({key[0]},{key[1]})     {EDGE_NAMES[e]:<7}{m.sum():4d}"
+                  f"   {mm[m].mean():+7.3f}  {np.sqrt((mm[m] ** 2).mean()):7.3f}")
+
+    def explained(A):
+        """Share of the residual variance a model A can account for."""
+        coef, *_ = np.linalg.lstsq(A, mm, rcond=None)
+        return max(0.0, 1.0 - np.var(mm - A @ coef) / max(np.var(mm), 1e-12))
+
+    # lens: an error in k1/k2 moves a point along the radius, so only the part
+    # of that motion across the line shows up in the residual
+    f = float(max(w, h))
+    rad = (IMG - [w / 2.0, h / 2.0]) / f
+    r2 = (rad ** 2).sum(axis=1)
+    proj = (rad * N).sum(axis=1)
+    lens = np.stack([proj * r2, proj * r2 ** 2], 1)
+    # paper: a smooth bow over the sheet, seen across the line
+    x = (P[:, 0] - P[:, 0].mean()) / 100.0
+    y = (P[:, 1] - P[:, 1].mean()) / 100.0
+    one = np.ones_like(x)
+    bow = np.stack([one, x, y, x * x, x * y, y * y], 1)
+    print(f"[snap] residual explained by: lens (k1/k2) {100 * explained(lens):4.0f}%"
+          f"   a smooth bow of the sheet {100 * explained(bow):4.0f}%")
+    horiz = np.array([l[2] in (0, 2) for l in lab])
+    print(f"       across the horizontal lines {np.sqrt((mm[horiz] ** 2).mean()):.3f} mm"
+          f"   across the vertical ones {np.sqrt((mm[~horiz] ** 2).mean()):.3f} mm")
+
+    if out_path and frame is not None:
+        vis = frame.copy()
+        for p, n, d in zip(IMG, N, D):
+            a = tuple(np.round(p).astype(int))
+            b = tuple(np.round(p + n * d * 50).astype(int))
+            cv2.line(vis, a, b, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.circle(vis, a, 2, (0, 255, 255), -1)
+        cv2.imwrite(out_path, vis)
+        print(f"[snap] residual map (x50) -> {out_path}")
 
 
 # ==========================================================================
@@ -729,20 +1448,26 @@ def draw_metric_grid(img, step_mm=50.0):
 def calibrate(cap, model):
     global FIT_MODE, DIST_K1, DIST_K2
     win = "calibrate"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    make_window(win)
     cv2.createTrackbar("col_off", win, 0, max(0, COLS - 1), lambda v: None)
     cv2.createTrackbar("row_off", win, 0, max(0, ROWS - 1), lambda v: None)
 
     k1, k2, kstep = DIST_K1, DIST_K2, DIST_STEP
     H_saved = None
+    do_refine, refine_dist = True, False
     print("[calib] point the camera at the squares. Use the col_off/row_off\n"
           "        trackbars to align the labels with the real positions.\n"
           "        The magenta quad is the consensus fit over all the squares -\n"
           "        its sides should sit on the outer edges of the whole block.\n"
+          "        The cyan outlines are the refined fit snapped onto the\n"
+          "        printed lines; 'snap' in the HUD is how far off they still\n"
+          "        are, in mm on the sheet - that is the number to minimise.\n"
           "        'a' auto-fits the lens distortion; 1/2 3/4 tune k1/k2 by hand\n"
           "        (watch 'line residual': lower = straighter = better),\n"
           "        5/6 change the step, 0 resets the distortion,\n"
-          "        'f' switches consensus/per-corner fit, 'c' saves.")
+          "        'e' toggles the sub-pixel refinement, 'r' lets it retune\n"
+          "        k1/k2 as well, 'f' switches consensus/per-corner fit,\n"
+          "        'c' saves.")
 
     while True:
         raw = read_frame(cap)
@@ -753,7 +1478,7 @@ def calibrate(cap, model):
         # to match)
         frame = undistort(raw, k1, k2)
         vis = frame.copy()
-        quads = detect_squares(frame)
+        quads, n_paired = detect_squares(frame)
         items, ncols, nrows = assign_local_grid(quads)
 
         col_off = cv2.getTrackbarPos("col_off", win)
@@ -777,18 +1502,46 @@ def calibrate(cap, model):
         cq, clines, _ = consensus_quad(matches)
         draw_consensus(vis, cq, clines, CONSENSUS_COLOR)
 
+        # the corner fit, then snapped onto the printed lines (cyan)
+        H_corner = None
+        H_live, rinfo = None, {"ok": False}
+        if matches:
+            H_corner, _, _ = compute_homography_consensus(matches, model)
+            if H_corner is None or FIT_MODE == "corners":
+                H_pts = compute_homography(matches, model)
+                if H_pts is not None:
+                    H_corner = H_pts
+        if do_refine and H_corner is not None:
+            H_live, nk1, nk2, rinfo = refine_homography(
+                cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY), H_corner, model,
+                k1, k2, keys=set((c, r) for (c, r, _) in matches),
+                refine_dist=refine_dist)
+            if rinfo["ok"]:
+                # feed the tuned distortion back in - the next frame is
+                # undistorted with it, so the loop settles after a few frames
+                k1, k2 = nk1, nk2
+                draw_model(vis, H_live, model, REFINE_COLOR)
+            else:
+                H_live = None
+
         # auto hint: if all 6 (3x2) are visible, the mapping is unambiguous
         auto = (ncols == COLS and nrows == ROWS)
-        txt = (f"detected={len(quads)} grid={ncols}x{nrows} "
+        txt = (f"detected={len(quads)} ({n_paired} centred) grid={ncols}x{nrows} "
                f"matched={len(matches)}  off=({col_off},{row_off})"
                f"{'  [AUTO 3x2]' if auto else ''}"
                f"{'' if cq is not None else '  [no consensus quad]'}")
         res = collinearity_residual(matches)
+        snap = (f"snap={rinfo['rms_mm']:.3f} mm ({rinfo['rms_px']:.2f} px) "
+                f"on {rinfo['n']}/{rinfo['n_total']} pts  "
+                f"ink={2 * rinfo['ink_mm']:.2f}mm"
+                f"{'  +k1k2' if refine_dist else ''}"
+                if rinfo["ok"] else ("snap: no lock" if do_refine else "snap: off"))
         hud = [txt,
                f"k1={k1:+.4f} k2={k2:+.4f} step={kstep:.4f}   "
                f"line residual={res:.3f} px   fit={FIT_MODE}",
+               snap,
                "1/2 k1  3/4 k2  5/6 step  a auto-fit dist  0 reset dist  "
-               "f fit  c save  q quit"]
+               "e refine  r +k1k2  v report  f fit  c save  q quit"]
         y = 30
         for ln in hud:
             cv2.putText(vis, ln, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
@@ -817,6 +1570,14 @@ def calibrate(cap, model):
             kstep = min(1.0, kstep * 2.0)
         elif key == ord('0'):
             k1 = k2 = 0.0
+        elif key == ord('e'):
+            do_refine = not do_refine
+        elif key == ord('r'):
+            refine_dist = not refine_dist
+        elif key == ord('v') and H_live is not None:
+            refine_report(cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY), H_live, model,
+                          k1, k2, keys=set((c, r) for (c, r, _) in matches),
+                          frame=raw, ink_mm=rinfo.get("ink_mm"))
         elif key == ord('a'):
             nk1, nk2, r = auto_distortion(matches, frame.shape[1],
                                           frame.shape[0], k1, k2)
@@ -835,9 +1596,33 @@ def calibrate(cap, model):
                 print("[calib] need >=4 corners (>=1 valid square, 2+ is better). "
                       "Check the offsets.")
                 continue
+            # the refinement gets the last word: same model, same frame, but
+            # fitted to the ink instead of to four corner estimates
+            if do_refine:
+                gray_raw = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
+                keys = set((c, r) for (c, r, _) in matches)
+                _, _, _, before = refine_homography(gray_raw, H, model, k1, k2,
+                                                    keys, iters=0)
+                Hr, k1r, k2r, after = refine_homography(
+                    gray_raw, H, model, k1, k2, keys, refine_dist=refine_dist)
+                if after["ok"]:
+                    print(f"[calib] line snap: {before['rms_mm']:.3f} -> "
+                          f"{after['rms_mm']:.3f} mm "
+                          f"({before['rms_px']:.2f} -> {after['rms_px']:.2f} px, "
+                          f"{after['n']}/{after['n_total']} sample points)")
+                    if after["rms_mm"] > 0.15:
+                        print("[calib] NOTE: >0.15 mm left after the snap. The "
+                              "fit cannot put all 24 printed lines on the ink "
+                              "at once, which points at the SHEET GEOMETRY "
+                              "(is this really the calibr.svg print?) or at "
+                              "leftover lens distortion, not at this frame.")
+                    H, k1, k2 = Hr, k1r, k2r
+                else:
+                    print("[calib] line snap: no lock (too few usable samples) "
+                          "- saving the corner fit.")
             np.savez(CALIB_FILE, H=H, px_per_mm=PX_PER_MM,
                      canvas_w=CANVAS_W, canvas_h=CANVAS_H,
-                     k1=k1, k2=k2,
+                     k1=k1, k2=k2, model_sig=model_signature(),
                      cam_w=frame.shape[1], cam_h=frame.shape[0])
             DIST_K1, DIST_K2 = k1, k2
             H_saved = H
@@ -855,6 +1640,11 @@ def calibrate(cap, model):
                 print(f"[calib] mean reprojection error: "
                       f"consensus={reprojection_error(matches, model, H_con):.2f} px  "
                       f"per-corner={reprojection_error(matches, model, H_pts):.2f} px")
+            if n_paired < len(matches):
+                print(f"[calib] ({len(matches) - n_paired} of {len(matches)} "
+                      f"squares gave only one contour - their corners sit half a "
+                      f"stroke off the centreline, so the reprojection number "
+                      f"above carries that offset. The snap residual does not.)")
             else:
                 print(f"[calib] mean reprojection error: "
                       f"{reprojection_error(matches, model, H):.2f} px")
@@ -878,6 +1668,12 @@ def reprojection_error(matches, model, H):
 # ==========================================================================
 #  RUN MODE - live rectification
 # ==========================================================================
+def model_signature():
+    """A fingerprint of the sheet geometry the calibration was made with."""
+    m = build_model()
+    return np.round(np.vstack([m[k] for k in sorted(m)]), 4).astype(np.float32)
+
+
 def load_calibration():
     """Return H, also restoring the saved lens distortion into DIST_K1/DIST_K2.
 
@@ -891,6 +1687,14 @@ def load_calibration():
         return None
     DIST_K1 = float(data["k1"]) if "k1" in data else 0.0
     DIST_K2 = float(data["k2"]) if "k2" in data else 0.0
+    # H is only meaningful together with the sheet geometry it was fitted to:
+    # change the model and every millimetre it reports moves, silently.
+    sig = model_signature()
+    old = data["model_sig"] if "model_sig" in data else None
+    if old is None or old.shape != sig.shape or not np.allclose(old, sig, atol=1e-3):
+        print(f"[calib] WARNING: {CALIB_FILE} was made with a different sheet "
+              f"geometry than the one configured now - recalibrate, or the "
+              f"reference will land a millimetre or two out.")
     return data["H"]
 
 
@@ -905,7 +1709,7 @@ def run(cap, model):
     M = H @ A                                  # output-px -> source-image-px
 
     win = "rectified"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    make_window(win)
     show_grid = False
     print("[run] live rectification. g=grid  c=recalibrate  q=quit")
 
@@ -932,7 +1736,7 @@ def run(cap, model):
             if newH is not None:
                 H = newH
                 M = H @ A
-            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            make_window(win)
     cv2.destroyWindow(win)
 
 
@@ -1147,7 +1951,7 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
     ow = oh = 0             # rendered view size for the current mode
 
     win = "overlay"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    make_window(win)
 
     # --- viewport (zoom/pan of the finished image) ---
     view = {"z": 1.0, "ox": 0.0, "oy": 0.0, "W": 1, "H": 1,
@@ -1366,12 +2170,19 @@ def generate_template(out_path, ppm=4.0):
     exactly on the real ones (a check of the whole chain). It is also handy as
     a base: draw the reference on top of this canvas and it will land with the
     correct proportions.
+
+    This is the honest thing to check the overlay against: it is the model
+    itself, drawn to the same tolerance the model is stated to, so anything
+    that does not line up on the sheet is the calibration and not the drawing.
+    A reference traced over a photo of the sheet by hand is good to a few
+    tenths of a millimetre at best, and its errors are indistinguishable from
+    the ones being hunted.
     """
     W = int(round(CANVAS_W * ppm))
     H = int(round(CANVAS_H * ppm))
     img = np.full((H, W, 3), 255, np.uint8)
     model = build_model()
-    th = max(1, int(round(ppm)))  # line thickness
+    th = max(1, int(round(STROKE_MM * ppm)))   # the printed line width
     for (col, row), corners in model.items():
         pts = np.array([world_to_template_px(p, ppm) for p in corners], np.int32)
         cv2.polylines(img, [pts], True, (0, 0, 0), th, cv2.LINE_AA)
@@ -1408,10 +2219,21 @@ def list_devices():
         else:
             print(f"  #{i}: -")
 
+    mons = list_displays()
+    print("\nDisplays (pass the index or the name to --display):")
+    if not mons:
+        print("  none detected - --display will be ignored, --fullscreen "
+              "still works on whichever monitor the window opens on")
+    for i, (name, x, y, w, h) in enumerate(mons):
+        print(f"  {i}: {name:<12} {w}x{h}+{x}+{y}")
+    if len({(x, y) for (_n, x, y, _w, _h) in mons}) < len(mons):
+        print("  NOTE: two monitors report the same position - they are "
+              "mirrored, and --display cannot tell them apart.")
+
 
 def main():
     global PX_PER_MM, CANVAS_W, CANVAS_H, REQ_WIDTH, REQ_HEIGHT, DISPLAY_MAX
-    global FIT_MODE, DIST_K1, DIST_K2
+    global FIT_MODE, DIST_K1, DIST_K2, FULLSCREEN, DISPLAY_TARGET, KEEP_AWAKE
     ap = argparse.ArgumentParser(description="Canvas perspective calibration/rectification")
     ap.add_argument("mode", choices=["calibrate", "run", "overlay", "gen-template", "list"])
     ap.add_argument("--cam", type=int, default=CAM_INDEX)
@@ -1430,6 +2252,8 @@ def main():
     ap.add_argument("--canvas-h-in", type=float, default=None,
                     help="canvas height in inches")
     ap.add_argument("--out", default=None, help="output file for gen-template")
+    ap.add_argument("--ppm", type=float, default=4.0,
+                    help="pixels per mm for gen-template (default 4.0)")
     ap.add_argument("--adjust", default=OVERLAY_ADJUST_FILE,
                     help="file for saved overlay adjustment parameters (.npz)")
     ap.add_argument("--fit", choices=["consensus", "corners"], default=None,
@@ -1445,6 +2269,13 @@ def main():
     ap.add_argument("--view-max", type=int, default=None,
                     help=f"longest side of the corrected overlay view "
                          f"(default {DISPLAY_MAX}; higher = sharper but slower)")
+    ap.add_argument("--fullscreen", action="store_true",
+                    help="open the window fullscreen")
+    ap.add_argument("--display", default=None,
+                    help="monitor to open on: an index or a name such as "
+                         "DP-1 ('list' prints them)")
+    ap.add_argument("--no-keep-awake", action="store_true",
+                    help="do not hold off sleep and the screensaver")
     args = ap.parse_args()
 
     if args.width:
@@ -1461,6 +2292,9 @@ def main():
         CANVAS_H = args.canvas_h_in * MM_PER_IN
     if args.fit:
         FIT_MODE = args.fit
+    FULLSCREEN = args.fullscreen
+    DISPLAY_TARGET = args.display
+    KEEP_AWAKE = not args.no_keep_awake
     # start calibration from the distortion tuned last time instead of from
     # zero, so recalibrating does not throw the lens settings away
     if args.mode == "calibrate":
@@ -1474,10 +2308,11 @@ def main():
         list_devices()
         return
     if args.mode == "gen-template":
-        generate_template(args.out or "calib_template.png")
+        generate_template(args.out or "calib_template.png", args.ppm)
         return
 
     model = build_model()
+    awake = KeepAwake(f"artprojector {args.mode}").start() if KEEP_AWAKE else None
     cap = open_camera(args.cam)
     try:
         if args.mode == "calibrate":
@@ -1489,6 +2324,8 @@ def main():
     finally:
         cap.release()
         cv2.destroyAllWindows()
+        if awake is not None:
+            awake.stop()
 
 
 if __name__ == "__main__":
