@@ -207,7 +207,9 @@ Loads `calibration.npz` and shows the rectified canvas plane in real time.
 Draws a reference over the live frame, projected into the canvas perspective.
 The reference is stretched to the whole canvas, so only the part inside the
 camera view is shown. Three render modes: contours (Canny edges), the original
-image, and multiply - all blended with adjustable opacity.
+image, and multiply - all blended with adjustable opacity. An optional third
+layer shows what changed since a snapshot (the brush, fresh paint) at full
+opacity on top.
 
 Controls:
 
@@ -221,6 +223,10 @@ Controls:
 | `m` | cycle contours / image / multiply |
 | `9` / `0` | opacity down / up |
 | `1` `2` / `3` `4` | Canny low / high thresholds |
+| `n` | snapshot the canvas + delta layer on (see below) |
+| `t` | delta layer on / off |
+| `5` / `6` | delta threshold down / up |
+| `v` | cycle the capture resolution (lower = faster, less detail) |
 | left / right | previous / next reference (when `--ref` is a folder) |
 | `o` | toggle overlay |
 | `c` | contour color |
@@ -232,6 +238,56 @@ interpolation, so it only ever darkens: white areas of the reference leave the
 camera image untouched and whatever is already drawn on the real canvas stays
 visible through the dark ones. That is what you want for checking work against
 a reference, where plain image mode would wash the canvas out.
+
+**Delta layer (experimental).** Normally there are two layers: the live camera
+frame and the reference blended over it. `n` adds a third. It snapshots the
+current frame - take it with nothing in front of the camera - and from then on
+the *snapshot* is the bottom layer instead of the live feed, with the reference
+blended over it as usual; on top of both, every pixel that now differs from the
+snapshot is painted straight from the live frame at full opacity. So the brush,
+the hand and fresh paint stay perfectly sharp and unblended while everything
+around them keeps the calm blended look, instead of the brush swimming under a
+half-transparent reference.
+
+`t` switches the layer off and on again without losing the snapshot; `n` retakes
+it. The difference is measured per channel (not on gray, so paint whose
+brightness matches the paper still registers), blurred against sensor noise,
+opened, and grown slightly so the fading outline of the brush is covered too.
+`5`/`6` set the threshold: too low and lighting drift makes the whole canvas
+count as delta, too high and thin strokes drop out. If the light in the room
+changes, or the canvas moves, retake the snapshot with `n`.
+
+**Speed.** Per frame at 2592x1944 into a 1545x2000 corrected view, camera
+excluded (measured on a 24-thread CPU, OpenCV 4.10):
+
+| | ms/frame |
+|---|---|
+| contours | 11 |
+| image | 9 |
+| multiply | 10 |
+| + delta layer | +5 |
+
+Everything is plain CPU OpenCV, and deliberately so. There is no CUDA in a
+`pip install opencv-python` build (`cv2.cuda.getCudaEnabledDeviceCount()` is 0),
+so the only GPU path available is OpenCL through `UMat`, and measured against
+these sizes it wins ~2x on `remap` (2.5 -> 1.1 ms) and nothing at all on
+`warpPerspective` (0.9 ms either way): the pixel counts here are small enough
+that IPP and 24 threads already saturate memory bandwidth, and the upload plus
+download alone costs 1.7 ms. What did matter was avoiding numpy on whole frames -
+boolean-indexed float32 gathers and `axis=2` reductions are single-threaded
+passes over 15 MB, and replacing three of them with OpenCV calls took image mode
+from 114 to 9 ms and multiply from 159 to 10 ms.
+
+The remaining per-frame cost is mostly the camera: MJPG decode of one
+2592x1944 frame is ~26 ms against ~6 ms at 1280x960, plus the USB transfer of
+4.5 MB against 1.1 MB, and no GPU touches either. That is what `v` is for - it
+retunes the live capture to the next smaller mode of the same aspect ratio and
+rescales H to match (H is in pixels, so it has to follow; `scale_homography`
+explains when that is legitimate and when it is not). Rectified alignment holds
+to ~0.1 mm at 1280x960 and ~0.3 mm at 640x480 on synthetic frames, so the cost
+of the switch is resolved detail when zoomed in, not accuracy. `v` wraps back
+round to full resolution, and a mode the camera will not actually stream is
+skipped rather than left broken.
 
 **A folder of references.** If `--ref` points to a directory, the first image in
 it (alphabetically) opens and the left/right arrows step to the previous/next

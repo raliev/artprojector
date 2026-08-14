@@ -445,6 +445,42 @@ def read_frame(cap, retries=30):
     return None
 
 
+# Capture modes offered for switching at runtime, largest first. Only the ones
+# matching the calibrated aspect ratio are ever used (see scale_homography), so
+# this list can name modes of several shapes safely.
+CAPTURE_MODES = [(2592, 1944), (1920, 1440), (1600, 1200), (1280, 960),
+                 (1920, 1080), (1280, 720), (800, 600), (640, 480)]
+
+
+def set_capture_mode(cap, w, h, settle=8, timeout=2.5):
+    """Retune a live capture to w x h. Returns the size actually in effect.
+
+    The request is only a request: V4L2 substitutes the nearest supported mode
+    without saying so, the first frames after a switch are still the old size or
+    black while the sensor re-exposes, and some modes on this class of camera
+    stream all-black forever (open_camera fights the same thing). So the frames
+    decide, not CAP_PROP_FRAME_*, and a mode that will not produce a picture
+    within `timeout` returns None for the caller to fall back on."""
+    if USE_MJPG:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    good = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ok, f = cap.read()
+        if ok and f is not None and f.max() > 0:
+            good = f
+            settle -= 1
+            if settle <= 0:
+                break
+        else:
+            time.sleep(0.02)
+    if good is None:
+        return None
+    return good.shape[1], good.shape[0]
+
+
 # ==========================================================================
 #  LENS DISTORTION
 #
@@ -1668,6 +1704,10 @@ def reprojection_error(matches, model, H):
 # ==========================================================================
 #  RUN MODE - live rectification
 # ==========================================================================
+CALIB_CAM_W = 0                    # capture size H was fitted at (0 = unknown)
+CALIB_CAM_H = 0
+
+
 def model_signature():
     """A fingerprint of the sheet geometry the calibration was made with."""
     m = build_model()
@@ -1679,14 +1719,20 @@ def load_calibration():
 
     H maps mm -> UNDISTORTED image pixels, so every consumer must push its
     frames through undistort(frame, DIST_K1, DIST_K2) first. Files written
-    before distortion tuning existed simply carry no k1/k2 and give 0."""
-    global DIST_K1, DIST_K2
+    before distortion tuning existed simply carry no k1/k2 and give 0.
+
+    The capture size H was fitted at lands in CALIB_CAM_W/H: H is in pixels, so
+    it only means anything together with the resolution that produced it (see
+    scale_homography)."""
+    global DIST_K1, DIST_K2, CALIB_CAM_W, CALIB_CAM_H
     try:
         data = np.load(CALIB_FILE)
     except FileNotFoundError:
         return None
     DIST_K1 = float(data["k1"]) if "k1" in data else 0.0
     DIST_K2 = float(data["k2"]) if "k2" in data else 0.0
+    CALIB_CAM_W = int(data["cam_w"]) if "cam_w" in data else 0
+    CALIB_CAM_H = int(data["cam_h"]) if "cam_h" in data else 0
     # H is only meaningful together with the sheet geometry it was fitted to:
     # change the model and every millimetre it reports moves, silently.
     sig = model_signature()
@@ -1696,6 +1742,26 @@ def load_calibration():
               f"geometry than the one configured now - recalibrate, or the "
               f"reference will land a millimetre or two out.")
     return data["H"]
+
+
+def scale_homography(H, from_wh, to_wh):
+    """H (mm -> pixels at `from_wh`) retargeted to a capture size of `to_wh`.
+
+    Pixel coordinates scale with the resolution, so the retarget is a plain
+    diagonal premultiply - but only if the other mode is the SAME field of view
+    sampled more coarsely (binned or scaled down), not a crop of the sensor. A
+    crop keeps the pixel scale and moves the principal point instead, and
+    nothing in H can tell the two apart. Hence the mode list sticks to the
+    calibrated aspect ratio, where a crop is unlikely; past that the check is
+    visual - the contours either still land on the printed squares or they do
+    not.
+
+    k1/k2 need no retarget: camera_matrix pins f to max(w,h) and the principal
+    point to the frame center, so the distortion model is expressed in units of
+    the frame itself and survives any uniform change of resolution."""
+    sx = to_wh[0] / float(from_wh[0])
+    sy = to_wh[1] / float(from_wh[1])
+    return np.diag([sx, sy, 1.0]) @ H
 
 
 def run(cap, model):
@@ -1862,6 +1928,48 @@ def draw_polylines_blended(canvas, pts, lens, M, color, alpha):
     roi[m] = (roi[m] * (1.0 - w) + np.array(color, np.float32) * w).astype(np.uint8)
 
 
+_MORPH_K3 = np.ones((3, 3), np.uint8)
+DELTA_SCALE = 2                    # the delta mask is built at 1/this of capture
+
+
+def delta_mask(snap, frame, thr, scale=DELTA_SCALE, blur=3, grow=2):
+    """Where `frame` differs from `snap`, as a 0/255 mask at 1/scale of capture.
+
+    The largest per-channel difference, not the gray one: paint whose luminance
+    happens to match the paper (yellows, light reds) would barely register in
+    gray. Speckle from sensor noise is averaged away by the downscale, blurred,
+    then opened; what survives is dilated a little, because the interesting part
+    of the brush is its outline and the outline is exactly where the difference
+    fades out.
+
+    Two things here are performance, not image processing, and both are worth
+    ~10x. The mask is computed small - a brush is hundreds of pixels wide, so
+    half resolution costs nothing visible (measured IoU 0.97 against the
+    full-res mask, the difference being a 3% wider edge) and turns ~18 ms per
+    frame into ~1.5 ms at 2592x1944. And every step is an OpenCV call: the
+    obvious numpy spellings (`absdiff(...).max(axis=2)`, `np.where(d >= thr)`)
+    are single-threaded passes over the whole array and cost more than all of
+    this together. The caller gets the reduced mask and folds the scale into the
+    warp that brings it to display resolution, so it is never resized twice."""
+    sw, sh = max(1, frame.shape[1] // scale), max(1, frame.shape[0] // scale)
+    if scale > 1:
+        # INTER_AREA averages, which is the noise suppression as well
+        a = cv2.resize(snap, (sw, sh), interpolation=cv2.INTER_AREA)
+        b = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
+    else:
+        a, b = snap, frame
+    if blur >= 3:
+        a = cv2.GaussianBlur(a, (blur, blur), 0)
+        b = cv2.GaussianBlur(b, (blur, blur), 0)
+    c0, c1, c2 = cv2.split(cv2.absdiff(a, b))
+    d = cv2.max(cv2.max(c0, c1), c2)
+    _, m = cv2.threshold(d, thr - 1, 255, cv2.THRESH_BINARY)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, _MORPH_K3)
+    if grow:
+        m = cv2.dilate(m, _MORPH_K3, iterations=grow)
+    return m
+
+
 def ref_to_world(ref_w, ref_h, dx, dy, sx, sy, theta_deg):
     """T: reference pixel -> world (mm). The ref is stretched to fill the whole
     canvas, plus adjustment: independent scales sx/sy, rotation about the canvas
@@ -1945,6 +2053,30 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
     rectified = False
     render_mode = "contours"       # "contours" | "image" | "multiply"
 
+    # --- delta layer (experimental) ------------------------------------------
+    # A snapshot of the canvas as it was, kept in undistorted camera pixels so
+    # it survives every view change (raw/corrected, zoom, pan). It replaces the
+    # live frame as the bottom layer, and whatever now differs from it - the
+    # brush, the hand, fresh paint - is painted back on top of the reference at
+    # full opacity. Three layers instead of two: snapshot, reference, delta.
+    snap = None                    # undistorted BGR frame, or None
+    delta_on = False
+    delta_thr = 18                 # per-channel levels of difference
+    DTHR = 2
+
+    # --- capture resolution, switchable at runtime ---------------------------
+    # Dropping the capture resolution is the one big lever left on the camera
+    # side: the USB transfer and the MJPG decode of every frame scale with the
+    # pixel count (~26 ms per frame at 2592x1944 against ~6 ms at 1280x960),
+    # and no amount of GPU touches either. The cost is resolved detail, which
+    # matters when zoomed in - hence a key rather than a setting.
+    H_calib = H                    # H exactly as fitted, never rescaled
+    calib_w, calib_h = CALIB_CAM_W, CALIB_CAM_H
+    H_wh = None                    # capture size the live H currently matches
+    cap_modes, cap_i = [], 0
+    fps = 0.0
+    t_prev = None
+
     MOVE, SCALE, ROT, DA = 2.0, 1.01, 0.5, 0.05  # steps
     # view transforms; lazy (they need the frame size)
     A = B = None            # corrected: out-px -> world-mm; raw: out-px -> cam-px
@@ -2005,6 +2137,9 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
           "          m contours/image/multiply, 9/0 opacity -/+,\n"
           "          LEFT/RIGHT arrows = previous/next reference in the folder,\n"
           "          1/2 3/4 Canny, o toggle, c color, r raw/corrected,\n"
+          "          n snapshot (of the empty canvas) + delta layer on,\n"
+          "          t delta layer on/off, 5/6 delta threshold -/+,\n"
+          "          v cycle capture resolution (lower = faster, less detail),\n"
           "          MOUSE: wheel or right button (drag) = zoom at cursor,\n"
           "          left button (drag) = pan, SPACE = reset zoom,\n"
           "          p save, i reset adjustment, h help, q quit")
@@ -2013,10 +2148,45 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
         frame = read_frame(cap)
         if frame is None:
             print("[overlay] no frame"); break
+        now = time.perf_counter()
+        if t_prev is not None:
+            dt = now - t_prev
+            if dt > 0:                       # smoothed, or it is unreadable
+                fps = 1.0 / dt if fps == 0.0 else 0.9 * fps + 0.1 / dt
+        t_prev = now
+
+        fw, fh = frame.shape[1], frame.shape[0]
+        if not cap_modes:
+            if not calib_w:
+                # a calibration file from before cam_w/cam_h were saved: it can
+                # only have been made at whatever the camera gives right now
+                calib_w, calib_h = fw, fh
+                print(f"[overlay] {CALIB_FILE} carries no capture size - "
+                      f"assuming it was made at {fw}x{fh}")
+            cap_modes = [m for m in CAPTURE_MODES
+                         if abs(m[0] / m[1] - calib_w / calib_h) < 0.01]
+            if (fw, fh) not in cap_modes:
+                cap_modes.append((fw, fh))
+                cap_modes.sort(key=lambda m: -m[0] * m[1])
+            cap_i = cap_modes.index((fw, fh))
+        if H_wh != (fw, fh):
+            # the capture size changed (by keypress, or by the camera itself):
+            # H is in pixels, so it has to follow
+            H = scale_homography(H_calib, (calib_w, calib_h), (fw, fh))
+            H_wh = (fw, fh)
+            A = B = None                     # both view transforms depend on it
+
         # H was fitted on undistorted pixels, so BOTH views (raw and corrected)
         # have to start from the undistorted frame or the overlay drifts at the
         # edges exactly where the lens bends the most
         frame = undistort(frame, DIST_K1, DIST_K2)
+        if snap is not None and snap.shape != frame.shape:
+            print("[overlay] camera frame size changed - snapshot dropped")
+            snap, delta_on = None, False
+        use_delta = delta_on and snap is not None
+        # the snapshot is the bottom layer while the mode is on; the live frame
+        # only comes back where it differs from it
+        base = snap if use_delta else frame
         # --- view transform: display px -> camera px, zoom folded in ---------
         if rectified:
             if A is None:
@@ -2031,11 +2201,31 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
                 B, ow, oh = raw_view_transform(frame.shape[1], frame.shape[0])
             src = B @ view_zoom_matrix(view, ow, oh)
 
-        if np.allclose(src, np.eye(3)):
-            disp = frame.copy()                  # raw at zoom 1: no resampling
+        live = dmask = None
+        identity = np.allclose(src, np.eye(3))
+        if identity:
+            disp = base.copy()                   # raw at zoom 1: no resampling
         else:
-            disp = cv2.warpPerspective(frame, src, (ow, oh),
+            disp = cv2.warpPerspective(base, src, (ow, oh),
                                        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+        if use_delta:
+            # the live frame and the mask go through separately, not as one
+            # 4-channel warp of the two stacked: warpPerspective has no fast
+            # path for 4 channels and the stacking copies 20 MB, which measures
+            # 25 ms against 1.6 ms for the pair.
+            live = frame if identity else cv2.warpPerspective(
+                frame, src, (ow, oh),
+                flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+            dm = delta_mask(snap, frame, delta_thr)
+            # the mask arrives reduced; its own scale folds into the warp that
+            # brings it to display resolution, so it is resampled exactly once
+            # (this is also what upscales it when src is the identity). NEAREST
+            # keeps it strictly 0/255, which cv2.copyTo below needs.
+            Ms = np.diag([dm.shape[1] / float(frame.shape[1]),
+                          dm.shape[0] / float(frame.shape[0]), 1.0]) @ src
+            dmask = cv2.warpPerspective(
+                dm, Ms, (ow, oh),
+                flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP)
         ch, cw = disp.shape[:2]
 
         if show:
@@ -2045,20 +2235,38 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
                 draw_polylines_blended(disp, epts, elens, M,
                                        OVERLAY_COLORS[color_i], alpha)
             else:
-                warped = cv2.warpPerspective(ref_small, M, (cw, ch),
-                                             flags=cv2.INTER_LINEAR)
-                mcov = cv2.warpPerspective(
-                    np.full(ref_small.shape[:2], 255, np.uint8), M, (cw, ch),
-                    flags=cv2.INTER_NEAREST) > 0
-                over = warped[mcov].astype(np.float32)
+                # Both modes blend only where the reference actually lands, and
+                # both get that for free from the warp border instead of from a
+                # coverage mask - a mask would mean a second warp plus a
+                # boolean-indexed float32 gather over the whole frame, which
+                # measures ~80 ms against ~3.5 ms for the two calls below.
                 if render_mode == "multiply":
                     # multiply only ever darkens, so the reference reads as ink
                     # laid over the canvas: white paper in the ref leaves the
                     # camera image untouched and what is drawn on the real
-                    # canvas stays visible through the dark areas.
-                    over *= disp[mcov] / 255.0
-                disp[mcov] = (disp[mcov] * (1.0 - alpha)
-                              + over * alpha).astype(np.uint8)
+                    # canvas stays visible through the dark areas. A white
+                    # border extends that no-op to everything outside the ref.
+                    over = cv2.warpPerspective(
+                        ref_small, M, (cw, ch), flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(255, 255, 255))
+                    over = cv2.multiply(over, disp, scale=1.0 / 255.0)
+                else:
+                    # BORDER_TRANSPARENT leaves dst alone where the ref does not
+                    # reach, so those pixels end up blending disp with disp
+                    over = disp.copy()
+                    cv2.warpPerspective(ref_small, M, (cw, ch), dst=over,
+                                        flags=cv2.INTER_LINEAR,
+                                        borderMode=cv2.BORDER_TRANSPARENT)
+                disp = cv2.addWeighted(disp, 1.0 - alpha, over, alpha, 0.0)
+
+        if use_delta:
+            # last, so the brush is never washed out by the reference: opaque,
+            # which is the whole point - everything around it keeps the usual
+            # blended look, the brush itself reads as bare camera.
+            # copyTo, not disp[dmask > 127] = live[...]: same result, ~0.5 ms
+            # instead of ~9 ms (no boolean gather, no scatter).
+            cv2.copyTo(live, dmask, disp)
 
         view["W"], view["H"] = cw, ch
 
@@ -2071,8 +2279,14 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
                    f"{'' if (DIST_K1 or DIST_K2) else ' no-undistort'}  "
                    f"render={cw}x{ch}"
                    + (f" {view['z'] / A[0, 0]:.1f}px/mm" if rectified else ""),
+                   f"delta={'on' if use_delta else ('armed' if delta_on else 'off')}"
+                   f"  thr={delta_thr}"
+                   f"  snapshot={'yes' if snap is not None else 'none (n)'}"
+                   f"  cam={fw}x{fh}"
+                   + ("" if (fw, fh) == (calib_w, calib_h) else " (scaled H)")
+                   + f"  {fps:.1f} fps",
                    "w/a/s/d move  z/x scale  [ ] X  - = Y  ,/. rot  m mode  9/0 alpha  "
-                   "1/2 3/4 canny  <-/-> ref  o c r  |  mouse: wheel/RMB zoom, LMB pan"]
+                   "1/2 3/4 canny  5/6 delta thr  n snap  t delta  v cam res  <-/-> ref"]
             y0 = 26
             for ln in hud:
                 cv2.putText(disp, ln, (10, y0), cv2.FONT_HERSHEY_SIMPLEX,
@@ -2143,6 +2357,42 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
         elif k == ord('p'):
             np.savez(adjust_path, dx=dx, dy=dy, sx=sx, sy=sy, theta=theta, alpha=alpha)
             print(f"[overlay] adjustment saved to {adjust_path}")
+        elif k == ord('n'):
+            # take the snapshot with nothing in front of the camera, then go
+            # draw: mode on straight away, since that is always what follows
+            snap = frame.copy()
+            delta_on = True
+            print(f"[overlay] snapshot taken ({snap.shape[1]}x{snap.shape[0]}), "
+                  f"delta on (thr={delta_thr})")
+        elif k == ord('t'):
+            if snap is None:
+                snap = frame.copy()
+                print("[overlay] no snapshot yet - taking one now")
+            delta_on = not delta_on
+            print(f"[overlay] delta {'on' if delta_on else 'off'}")
+        elif k == ord('v'):
+            # step to the next (smaller) capture mode, wrapping back to full;
+            # a mode the camera cannot really stream is skipped, not fatal
+            for step in range(1, len(cap_modes)):
+                want = cap_modes[(cap_i + step) % len(cap_modes)]
+                print(f"[overlay] switching capture to {want[0]}x{want[1]}...")
+                got = set_capture_mode(cap, *want)
+                if got is None:
+                    print(f"[overlay] {want[0]}x{want[1]} delivers nothing - skipped")
+                    continue
+                cap_i = (cap_modes.index(got) if got in cap_modes
+                         else (cap_i + step) % len(cap_modes))
+                if got != want:
+                    print(f"[overlay] camera substituted {got[0]}x{got[1]}")
+                # the snapshot belongs to the old resolution; the loop drops it
+                # on the size change, so say why rather than let it vanish
+                if snap is not None and got != (fw, fh):
+                    print("[overlay] retake the snapshot (n) at the new resolution")
+                break
+        elif k == ord('5'):
+            delta_thr = max(1, delta_thr - DTHR)
+        elif k == ord('6'):
+            delta_thr = min(255, delta_thr + DTHR)
         elif k in (ord('1'), ord('2'), ord('3'), ord('4')):
             if k == ord('1'):
                 canny_lo = max(0, canny_lo - 5)
