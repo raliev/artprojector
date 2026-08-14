@@ -34,16 +34,21 @@ canvas size, so changing the canvas size does not require recalibration.
 ## Usage
 
 ```
-python canvas_rectify.py list                 # list cameras and resolutions
-python canvas_rectify.py calibrate            # detect squares, compute homography
-python canvas_rectify.py run                  # live rectified (fronto-parallel) view
-python canvas_rectify.py overlay --ref img.jpg  # reference contours/image over the feed
-python canvas_rectify.py gen-template         # generate a full-canvas target template
+python artprojector.py list                 # list cameras and resolutions
+python artprojector.py calibrate            # detect squares, compute homography
+python artprojector.py run                  # live rectified (fronto-parallel) view
+python artprojector.py overlay --ref img.jpg  # reference contours/image over the feed
+python artprojector.py overlay --ref ref/nadya111/4/bw  # a folder: arrows switch reference
+python artprojector.py gen-template         # generate a full-canvas target template
 ```
 
 Common options: `--cam N` (camera index, default 0), `--px-per-mm 2.0` (output
-scale), `--ref FILE` (reference for overlay), `--canvas-w-in 12 --canvas-h-in 16`
-(canvas size), `--adjust FILE.npz` (where overlay saves/loads its adjustment).
+scale), `--ref FILE|DIR` (reference for overlay; a folder is stepped through
+with the arrow keys), `--canvas-w-in 12 --canvas-h-in 16`
+(canvas size), `--adjust FILE.npz` (where overlay saves/loads its adjustment),
+`--view-max 2000` (render size of the corrected overlay view),
+`--fit consensus|corners` (how the homography is fitted), `--k1/--k2` (starting
+lens distortion for `calibrate`; normally just press `a` there instead).
 
 The camera must not move between `calibrate` and `run`/`overlay`.
 
@@ -56,6 +61,32 @@ and `row_off` trackbars shift the label mapping when only part of the block is
 visible (leave them at 0 for a full 3x2 view). Press `c` to compute and save the
 homography to `calibration.npz`; the mean reprojection error is printed.
 
+**Consensus quad.** The magenta quadrilateral is the fit the perspective is
+actually computed from. Corners of the individual squares are localized
+unreliably, so instead of trusting any one of them, the four outer edges of the
+whole block are fitted as straight lines through every corner that belongs to
+them - the top edge from all three squares of the top row, the left edge from
+both squares of the left column, and so on - and the quad is where those lines
+intersect. The per-square errors average out, and the six squares correct each
+other. Its sides should sit right on the outer edges of the block; if one is
+visibly off, a square was mis-detected. `f` switches to the old per-corner
+least-squares fit (`--fit corners` to start there). On synthetic targets with
+1.5 px corner noise the consensus fit is ~10% more accurate on average and
+~25% at the 95th percentile.
+
+**Lens distortion.** A wide camera bows straight lines near the frame edges, so
+squares out there are not really quadrilaterals and both the detection and the
+fit suffer. Press `a` to auto-fit the radial coefficients: it solves for the
+`k1`/`k2` that make the target's grid lines straightest, which takes a fraction
+of a second. `1`/`2` and `3`/`4` adjust `k1`/`k2` by hand, `5`/`6` change the
+step, `0` resets. The `line residual` in the HUD is the mean distance from the
+corners to the line they should lie on - minimize it. Detection, the consensus
+quad and the homography all run on the corrected frame, and the coefficients
+are saved into `calibration.npz`, so `run` and `overlay` undistort every frame
+automatically (both the raw and the corrected view). In a synthetic test with
+`k1=-0.12` the correction cut the resulting canvas-corner error from ~13 px to
+~0.5 px.
+
 ### run
 
 Loads `calibration.npz` and shows the rectified canvas plane in real time.
@@ -65,8 +96,8 @@ Loads `calibration.npz` and shows the rectified canvas plane in real time.
 
 Draws a reference over the live frame, projected into the canvas perspective.
 The reference is stretched to the whole canvas, so only the part inside the
-camera view is shown. Two render modes: contours (Canny edges) and the original
-image blended with adjustable opacity.
+camera view is shown. Three render modes: contours (Canny edges), the original
+image, and multiply - all blended with adjustable opacity.
 
 Controls:
 
@@ -77,24 +108,48 @@ Controls:
 | `[` / `]` | stretch X down / up |
 | `-` / `=` | stretch Y down / up |
 | `,` / `.` | rotate |
-| `m` | switch contours / original image |
+| `m` | cycle contours / image / multiply |
 | `9` / `0` | opacity down / up |
 | `1` `2` / `3` `4` | Canny low / high thresholds |
+| left / right | previous / next reference (when `--ref` is a folder) |
 | `o` | toggle overlay |
 | `c` | contour color |
 | `r` | raw (perspective) vs corrected proportions view |
 | `p` `i` `h` `q` | save adjustment / reset adjustment / help / quit |
 
+**Multiply mode** blends the reference multiplicatively instead of by
+interpolation, so it only ever darkens: white areas of the reference leave the
+camera image untouched and whatever is already drawn on the real canvas stays
+visible through the dark ones. That is what you want for checking work against
+a reference, where plain image mode would wash the canvas out.
+
+**A folder of references.** If `--ref` points to a directory, the first image in
+it (alphabetically) opens and the left/right arrows step to the previous/next
+one. There is no wrap-around: the ends of the list are a stop. Everything else -
+alignment, opacity, Canny thresholds, render mode, zoom and pan, raw/corrected
+view - carries over untouched, so switching swaps only the picture. Dots in the
+top-right corner show the position in the set (a `N/M` counter past 24 files).
+This suits the layered output of `make_refs.py`: point `--ref` at
+`ref/<stem>/<N>/bw` and flip through the tonal levels while painting.
+
 Mouse: wheel or right-button drag zooms at the cursor, left-button drag pans,
 Space resets the zoom. Zoom and pan work on top of any mode without disturbing
 the overlay, which is useful for magnifying a fragment in the center of the
-frame. The adjustment (offset, scale, rotation, opacity) is saved to the
+frame. Zoom is folded into the warp rather than applied to the finished image,
+so magnifying resamples the sensor frame directly and does resolve more detail
+(up to the sensor limit), and the contours are re-rasterized thin at every zoom
+level. The adjustment (offset, scale, rotation, opacity) is saved to the
 `--adjust` file and loaded on the next run.
 
 The `r` view: in raw mode a square filmed at an angle appears as a trapezoid and
 the reference follows the same perspective; in corrected mode the proportions
 are undone, so the square looks square and the reference is square. The
-corrected view is cropped to what the camera sees.
+corrected view is framed on the canvas plus a 20 mm margin - not on everything
+the camera sees, which at a steep angle spans meters of wall and would leave
+the canvas itself resolved at ~1 px/mm. Its scale is taken from the local scale
+of the homography over the canvas (typically 3-6 px/mm), capped by `--view-max`
+(default 2000 px on the longest side; raise it for a sharper view at a lower
+frame rate).
 
 ### gen-template
 
@@ -102,7 +157,7 @@ corrected view is cropped to what the camera sees.
 positions:
 
 ```
-python canvas_rectify.py gen-template --out calib_template.png
+python artprojector.py gen-template --out calib_template.png
 ```
 
 Overlaying this template (`overlay --ref calib_template.png`) lands the contours
@@ -135,7 +190,7 @@ splits into levels. Any of these files can be passed to `overlay --ref ...`.
 
 ## Geometry configuration
 
-See the "GEOMETRY CONFIG" block in `canvas_rectify.py`:
+See the "GEOMETRY CONFIG" block in `artprojector.py`:
 
 - Canvas size (`CANVAS_W_IN`, `CANVAS_H_IN`) or the `--canvas-w-in/--canvas-h-in`
   flags.
@@ -153,7 +208,9 @@ See the "GEOMETRY CONFIG" block in `canvas_rectify.py`:
 
 ## Files
 
-- `canvas_rectify.py` - the main tool (calibrate / run / overlay / gen-template / list).
+- `artprojector.py` - the main tool (calibrate / run / overlay / gen-template / list).
 - `capture.py` - grab one frame to a file (for debugging).
 - `make_refs.py` - posterized reference variations.
 - `calibr-1216.png` - printable calibration target.
+- `calibration.npz` - written by `calibrate`: the homography `H` (mm -> undistorted
+  image px), the lens distortion `k1`/`k2`, and the canvas size it was made for.

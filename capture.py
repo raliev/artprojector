@@ -58,7 +58,7 @@ def main():
 
     if frame is None:
         raise SystemExit("No frame captured (check camera access and the --cam index, "
-                         "see python canvas_rectify.py list)")
+                         "see python artprojector.py list)")
     cv2.imwrite(args.out, frame)
     print(f"saved: {args.out}  ({frame.shape[1]}x{frame.shape[0]})")
 
