@@ -4,9 +4,22 @@
 artprojector.py
 ===============
 
-Calibrate and rectify the perspective of a canvas using a target of six
-~63 mm squares (calibr.svg) printed on an 8.5x11" sheet that sits flush with
-the right and bottom edges of a 12x16" canvas.
+Calibrate and rectify the perspective of a canvas from a printed target.
+
+Two targets are supported, and they are read by completely different first
+stages that hand the same thing - a set of named quads with known millimetres -
+to the same second stage:
+
+  --target squares  (the default) six ~63 mm squares, calibr.svg, printed on an
+                    8.5x11" sheet sitting flush with the right and bottom edges
+                    of a 12x16" canvas. The whole sheet has to be in view and
+                    which square is which is set by hand.
+  --target grid     a 1-inch grid the size of the canvas with an ArUco marker
+                    in every cell; `python gridtarget.py` prints it to
+                    templates/ as full-size, A4 and Letter PDFs. Two or three
+                    cells anywhere in the frame are enough, and each one names
+                    itself, so the camera can sit as close to the canvas as it
+                    likes and nothing is aligned by hand.
 
 Modes:
   calibrate  - find the corners of the visible squares and compute the
@@ -21,6 +34,7 @@ Usage:
   python artprojector.py calibrate           # calibration
   python artprojector.py run                 # live rectification
   python artprojector.py list                # list cameras and monitors
+  python artprojector.py grid-probe --board 16x20   # why is the grid not seen?
 
   --fullscreen --display DP-1                # where the window opens
   --no-keep-awake                            # let the machine sleep
@@ -57,6 +71,8 @@ import threading
 import time
 import numpy as np
 import cv2
+
+import gridtarget as gt            # geometry of the 1-inch ArUco grid target
 
 # ==========================================================================
 #  GEOMETRY CONFIG  (all sizes in millimeters)
@@ -359,9 +375,16 @@ REFINE_COLOR = (255, 255, 0)       # cyan - the refined fit, drawn over the ink
 def build_model():
     """Return dict {(col,row): (4,2) float32} of corners TL,TR,BR,BL in mm.
 
+    With --target grid this is the 1-inch grid instead (see below), and
+    everything downstream - the line snap, the rectification, gen-template,
+    the calibration signature - carries on unchanged, because a target here is
+    nothing but a set of named quads with known millimetres.
+
     The sheet layout comes from SHEET_RECTS_MM (page coordinates); it is
     shifted so that the outermost printed lines sit at the measured margins
     from the canvas corner."""
+    if TARGET == "grid":
+        return build_grid_cell_model()
     # centreline of the rightmost / bottom-most printed line, in page mm
     right = max(x for (x, _) in SHEET_RECTS_MM.values()) + SQUARE_MM
     bottom = max(y for (_, y) in SHEET_RECTS_MM.values()) + SQUARE_MM
@@ -381,6 +404,334 @@ def build_model():
             [x0,     y0 + s],   # BL
         ], dtype=np.float32)
     return model
+
+
+# ==========================================================================
+#  TARGET #2 - THE 1-INCH ARUCO GRID   (--target grid)
+#
+#  The six-square sheet above has to be seen WHOLE, in a known place, to mean
+#  anything: the squares are anonymous, so which is which is set by hand with
+#  the col_off/row_off trackbars, and a camera parked 20 cm from a corner of
+#  the canvas sees nothing usable at all.
+#
+#  The grid target replaces it with a 1-inch grid the size of the canvas and an
+#  ArUco marker in every cell (gridtarget.py prints it). Every cell then names
+#  itself, which changes what a frame has to contain: two or three cells
+#  anywhere on the canvas are enough, because the markers give the absolute
+#  position and the grid lines around them give the perspective. Nothing is
+#  aligned by hand and nothing can be off by one cell.
+#
+#  The division of labour between the two features is the important part, and
+#  it is not "markers instead of lines":
+#
+#    * the MARKERS are read for identity, and for a first homography. Four
+#      corners of one 16 mm marker already determine one, which is what makes a
+#      2-cell view work at all - but 16 mm of baseline is a poor lever for a
+#      400 mm canvas, so that homography is a starting point, not the answer.
+#    * the GRID LINES are what the answer is measured on. refine_homography()
+#      snaps the fit onto the printed ink exactly as it does for the squares,
+#      and the lines are the longest, straightest, best-localised features on
+#      the sheet.
+#
+#  Which is also why the marker is 16 mm inside a 25.4 mm cell: the 4.7 mm ring
+#  of blank paper around it keeps the marker out of the few millimetres the
+#  line snap searches through. Ink that close to a line would be measured AS
+#  the line.
+#
+#  About the lines curving: at a short distance and a wide angle the printed
+#  grid does bend across the frame, and it is barely visible on the two or
+#  three cells the fit uses - which is exactly why it must be dealt with. It is
+#  lens distortion, not perspective (perspective keeps straight lines straight),
+#  so it belongs to k1/k2 and not to H: 'a' fits them to the marker corners,
+#  'r' lets the line snap keep refining them. Fitting a homography to a bent
+#  frame without that just buries the bend in H, where it comes back as
+#  millimetres somewhere else on the canvas.
+# ==========================================================================
+TARGET = "squares"                 # "squares" (calibr.svg) | "grid" (ArUco)
+GRID_BOARD = "12x16"               # which printed board, see gridtarget.BOARDS
+
+# Where the board sits on the canvas: the world coordinates of the board's
+# BOTTOM-RIGHT corner - the corner of the outermost printed line, not of the
+# paper. Zero means it is flush with the bottom-right corner of the canvas,
+# which is the world origin.
+#
+# This is the one number the printed grid cannot tell you. Everything else -
+# the perspective, the scale, which cell is which - is measured off the ink, so
+# it does not care where the sheet is. But the whole point of the exercise is
+# to say where a point on the CANVAS is, and nothing in the frame marks the
+# canvas edge, so the link between the two is the mounting, and it has to be
+# stated. Get it wrong by a centimetre and every millimetre this tool reports
+# is out by a centimetre, while every diagnostic still reads perfect.
+#
+# Two ways to make it true. Trim along the printed border on the right and
+# bottom and tape that edge flush to the canvas - then these stay zero and
+# nothing is measured. Or leave the paper margins on, measure the two gaps with
+# a ruler, and put them here (negative: the board sits left of and above the
+# canvas corner) with --grid-anchor-x / --grid-anchor-y.
+#
+# Changing them changes the model, so the saved calibration goes stale and
+# `calibrate` has to run again. That is not pedantry: H was fitted in the old
+# world frame and means something different in the new one.
+GRID_ANCHOR_X_MM = 0.0
+GRID_ANCHOR_Y_MM = 0.0
+GRID_ANCHOR_EXPLICIT = False       # --grid-anchor-* given; do not adopt the file's
+GRID_ANCHOR_FROM_FILE = False      # inherited from the last calibration
+
+# The line snap's search ranges, for the grid. They are far wider than the
+# square sheet's because the grid is far emptier: the nearest ink to a grid
+# line is the marker, 4.7 mm away, against 1.355 mm between two squares' lines.
+# Both still have to stay well inside that 4.7 mm - a sample that wanders onto
+# a marker measures its edge and reports a confident, wrong fit.
+GRID_SEARCH_MM = 1.5
+GRID_COARSE_MM = 3.0
+
+
+def use_grid_target(board=None):
+    """Switch the whole tool over to the ArUco grid.
+
+    The refinement reads STROKE_MM / REFINE_SEARCH_MM / REFINE_COARSE_MM as
+    globals at call time, so pointing them at the grid's numbers here is all it
+    takes; nothing in the refinement knows which target it is looking at."""
+    global TARGET, GRID_BOARD, STROKE_MM
+    global REFINE_SEARCH_MM, REFINE_COARSE_MM, REFINE_USE_COARSE
+    TARGET = "grid"
+    if board:
+        gt.board_spec(board)                     # raises on an unknown name
+        GRID_BOARD = board
+    STROKE_MM = gt.LINE_MM
+    REFINE_SEARCH_MM = GRID_SEARCH_MM
+    REFINE_COARSE_MM = GRID_COARSE_MM
+    REFINE_USE_COARSE = False                    # see REFINE_USE_COARSE
+
+
+def grid_origin_mm():
+    """World mm of the board's TOP-LEFT corner.
+
+    Board-local coordinates run right and DOWN from that corner (gridtarget's
+    frame); the world runs right and down from the canvas's top-left too, only
+    with its zero at the bottom-right corner. So the two differ by a shift."""
+    cols, rows, _ = gt.board_spec(GRID_BOARD)
+    return (GRID_ANCHOR_X_MM - cols * gt.CELL_MM,
+            GRID_ANCHOR_Y_MM - rows * gt.CELL_MM)
+
+
+def _rect_quad(rect, ox, oy):
+    """(bx0,by0,bx1,by1) board mm -> (4,2) world mm, ordered TL,TR,BR,BL."""
+    x0, y0, x1, y1 = rect
+    return np.array([[x0 + ox, y0 + oy], [x1 + ox, y0 + oy],
+                     [x1 + ox, y1 + oy], [x0 + ox, y1 + oy]], np.float32)
+
+
+def build_grid_cell_model():
+    """{(col,row): (4,2)} - the CENTRELINES of each cell's four grid lines.
+
+    This is the model the line snap and everything downstream work on. Cells
+    share their lines with their neighbours, so a shared line gets sampled
+    twice, once from each side - which is harmless and mildly useful: the two
+    measurements approach it from opposite directions and their biases, if
+    any, cancel."""
+    cols, rows, _ = gt.board_spec(GRID_BOARD)
+    ox, oy = grid_origin_mm()
+    return {(c, r): _rect_quad(gt.cell_rect_mm(c, r), ox, oy)
+            for r in range(rows) for c in range(cols)}
+
+
+def build_grid_marker_model():
+    """{(col,row): (4,2)} - the four corners of each printed ArUco marker.
+
+    Same order as cv2.aruco.detectMarkers() returns them for a marker printed
+    the right way up: top-left first, then clockwise."""
+    cols, rows, _ = gt.board_spec(GRID_BOARD)
+    ox, oy = grid_origin_mm()
+    return {(c, r): _rect_quad(gt.marker_rect_mm(c, r), ox, oy)
+            for r in range(rows) for c in range(cols)}
+
+
+_ARUCO_DET = None
+
+
+def aruco_detector():
+    """The detector, tuned for this target rather than for the defaults.
+
+    minMarkerPerimeterRate is the one that matters. It defaults to 0.03, i.e.
+    a marker side must be at least 3% of the frame - and a 16 mm marker seen
+    across a whole 16x20" board is about 4%, so the default sits right on the
+    edge of losing the wide shot entirely. Dropped to 0.01 the same frame has
+    a comfortable margin, at the price of considering more small contours,
+    which costs a few milliseconds and no accuracy: a false candidate still
+    has to decode as a valid 4x4 codeword.
+
+    perspectiveRemovePixelPerCell is raised because this target is meant to be
+    photographed from a bad angle: the marker is un-warped to a square before
+    its bits are read, and 8 pixels per module instead of 4 keeps that read
+    honest when the far side of the marker is half the size of the near one."""
+    global _ARUCO_DET
+    if _ARUCO_DET is None:
+        p = cv2.aruco.DetectorParameters()
+        p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        p.cornerRefinementWinSize = 5
+        p.cornerRefinementMaxIterations = 60
+        p.cornerRefinementMinAccuracy = 0.01
+        p.minMarkerPerimeterRate = 0.01
+        p.adaptiveThreshWinSizeMax = 43
+        p.adaptiveThreshWinSizeStep = 8
+        p.perspectiveRemovePixelPerCell = 8
+        _ARUCO_DET = cv2.aruco.ArucoDetector(gt.aruco_dictionary(), p)
+    return _ARUCO_DET
+
+
+GRID_BORDER_FRAC = 0.06            # of a marker side; see detect_grid_cells
+
+# Smallest marker, in pixels of side, that is allowed to mean anything. A 4x4
+# marker is 6 modules across, so 20 px is already only 3.3 px per module and
+# near the floor of what can be read at all; below that a "decode" is the error
+# correction inventing a codeword out of noise. minMarkerPerimeterRate is set
+# low (see aruco_detector) so that a whole board seen from across the room
+# still registers, and this is the other half of that trade: it buys the small
+# real markers without also buying the three-pixel imaginary ones.
+GRID_MIN_MARKER_PX = 20.0
+
+
+def detect_grid_cells(frame, k1=0.0, k2=0.0):
+    """Find the markers -> ([(col,row,quad)], n_foreign, n_clipped).
+
+    `frame` is the RAW camera frame and the quads come back in UNDISTORTED
+    pixels, which is where H lives. Detecting on the raw frame and undistorting
+    the four corners - rather than undistorting the frame and detecting on that
+    - is the same choice the line refinement makes, for two reasons that both
+    bite here. Nothing resamples the image before the corner is measured; and
+    undistort() fills what it cannot see with black, so at k1=-0.19 the corners
+    of the undistorted frame are black wedges pulled in from beyond the sensor,
+    and a marker sitting in one is thresholded against them. A marker is small
+    enough that the lens is very nearly affine across it, so its corners are
+    still corners in the raw frame.
+
+    quad is the MARKER's four corners, not the cell's; the cell has no corner
+    of its own that anything measured.
+
+    n_foreign counts markers that decoded cleanly but are not on the configured
+    board - the disjoint id ranges doing their job, and usually a sign that
+    --board names the wrong sheet.
+
+    n_clipped counts markers dropped for touching the edge of the frame. They
+    have to go: the contour of a marker the sensor cut off is closed along the
+    frame border instead of along the ink, which drags its corners inward by
+    whole pixels - 20 px on a 208 px marker, measured - while the marker still
+    decodes perfectly and looks like any other. The margin scales with the
+    marker because that inward drag does too."""
+    cols, rows, base = gt.board_spec(GRID_BOARD)
+    gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+    corners, ids, _ = aruco_detector().detectMarkers(gray)
+    matches, foreign, clipped = [], 0, 0
+    if ids is None:
+        return matches, foreign, clipped
+    for quad, mid in zip(corners, ids.reshape(-1)):
+        q = np.asarray(quad, np.float32).reshape(4, 2)
+        side = float(np.mean([np.linalg.norm(q[i] - q[(i + 1) % 4])
+                              for i in range(4)]))
+        if side < GRID_MIN_MARKER_PX:
+            continue
+        m = max(2.0, GRID_BORDER_FRAC * side)
+        if (q[:, 0].min() < m or q[:, 1].min() < m
+                or q[:, 0].max() > w - 1 - m or q[:, 1].max() > h - 1 - m):
+            clipped += 1
+            continue
+        cell = gt.cell_of_id(int(mid), cols, rows, base)
+        if cell is None:
+            foreign += 1
+            continue
+        if k1 or k2:
+            q = undistort_points(q, k1, k2, w, h).astype(np.float32)
+        matches.append((cell[0], cell[1], q))
+    return matches, foreign, clipped
+
+
+def compute_homography_markers(matches, marker_model):
+    """(H, inliers) from the marker corners; H is None if there are none.
+
+    A single marker gives exactly four points, which is a homography exactly -
+    RANSAC has nothing to vote on there, so that case is solved directly.
+
+    With more than one, the vote matters, and not only for corner noise. A
+    marker that is half hidden - by a hand, a brush, the edge of the canvas -
+    still gets read, and ArUco's error correction can turn the garbage into a
+    VALID id: it happens, and the id it invents is a plausible one. Two things
+    catch it. The id ranges of the two boards are disjoint, so half of those
+    inventions are simply not on this board; and the rest are geometric
+    outliers, which is what RANSAC is for - one marker claiming to be a cell it
+    is not cannot agree with the others about where the board is. `inliers` is
+    the subset that agreed, and it is what the line snap should be told about,
+    because a cell key that is off by one puts every sample on the wrong
+    printed line - and the grid being periodic, the wrong line looks exactly
+    like the right one.
+
+    None of that helps with a single marker, where there is nothing to
+    disagree with. Two or three cells in view is the honest minimum."""
+    world, img, keys = [], [], []
+    for (col, row, quad) in matches:
+        if (col, row) in marker_model:
+            world.append(marker_model[(col, row)])
+            img.append(quad)
+            keys.append((col, row, quad))
+    if not world:
+        return None, []
+    W = np.vstack(world).astype(np.float32)
+    I = np.vstack(img).astype(np.float32)
+    if len(W) == 4:
+        return cv2.getPerspectiveTransform(W, I), keys
+    H, mask = cv2.findHomography(W, I, cv2.RANSAC, 3.0)
+    if H is None:
+        return None, []
+    # a marker counts as an inlier if at least two of its corners did: a
+    # correct marker rarely loses more than one corner to the threshold, a
+    # fabricated one rarely keeps two
+    m = mask.reshape(-1, 4).sum(axis=1) if mask is not None else None
+    inliers = keys if m is None else [k for k, s in zip(keys, m) if s >= 2]
+    return H, (inliers or keys)
+
+
+def grid_view_span(matches):
+    """(n_cells, cols_seen, rows_seen, span_mm) of what is in the frame.
+
+    The span is the diagonal of the block of cells that was recognised, and it
+    is the number to watch: the fit is measured over it and used over the whole
+    canvas, so the ratio of the two is how far the answer is being
+    extrapolated."""
+    if not matches:
+        return 0, 0, 0, 0.0
+    cs = [c for (c, _, _) in matches]
+    rs = [r for (_, r, _) in matches]
+    w = (max(cs) - min(cs) + 1) * gt.CELL_MM
+    h = (max(rs) - min(rs) + 1) * gt.CELL_MM
+    return len(matches), max(cs) - min(cs) + 1, max(rs) - min(rs) + 1, float(np.hypot(w, h))
+
+
+def draw_grid_overlay(vis, H, cell_model, matches, pad=1):
+    """Draw the fitted grid over the frame, plus the canvas outline.
+
+    Only the cells around the ones that were recognised are drawn. Projecting
+    the whole 320-cell board through a homography fitted to a 50 mm patch sends
+    the far cells to coordinates that overflow an int32 and takes cv2.polylines
+    with them; and a grid drawn where nothing was measured would be claiming
+    an accuracy this frame cannot support anyway."""
+    if H is None or not matches:
+        return
+    cs = [c for (c, _, _) in matches]
+    rs = [r for (_, r, _) in matches]
+    sub = {k: v for k, v in cell_model.items()
+           if min(cs) - pad <= k[0] <= max(cs) + pad
+           and min(rs) - pad <= k[1] <= max(rs) + pad}
+    draw_model(vis, H, sub, REFINE_COLOR, 1)
+    # the canvas outline, if it lands anywhere sane
+    box = np.array([[-CANVAS_W, -CANVAS_H], [0.0, -CANVAS_H],
+                    [0.0, 0.0], [-CANVAS_W, 0.0]], np.float64)
+    p = np.hstack([box, np.ones((4, 1))]) @ np.asarray(H, np.float64).T
+    if np.all(np.abs(p[:, 2]) > 1e-9):
+        p = p[:, :2] / p[:, 2:3]
+        if np.all(np.abs(p) < 1e5):
+            cv2.polylines(vis, [np.round(p).astype(np.int32)], True,
+                          (0, 200, 255), 2, cv2.LINE_AA)
 
 
 # ==========================================================================
@@ -972,6 +1323,19 @@ REFINE_COARSE_MM = 3.0     # ditto for the coarse pass, which only uses the
 REFINE_MIN_CONTRAST = 12.0  # gray levels between the paper and the line
 REFINE_ITERS = 6
 
+# Whether to run the coarse pass at all (see refine_homography). It earns its
+# place on the six-square sheet, where the fine search may only look 0.62 mm
+# and the corner fit it starts from is often further out than that. On the
+# grid it is a liability and use_grid_target() turns it off: the fine search
+# there is 1.5 mm against a 25.4 mm pitch, so the ArUco fit always starts
+# inside capture range and the coarse pass has nothing to contribute - while
+# what it fits is the outline of whichever cells happened to be recognised,
+# which is a ragged, short and sometimes nearly degenerate set of edges. Fitting
+# eight degrees of freedom to that can and does throw the estimate metres off
+# (measured: 0.2 mm -> 10.5 mm on one 24-cell view), and the fine pass then
+# only claws part of it back.
+REFINE_USE_COARSE = True
+
 
 EDGE_NAMES = ("top", "right", "bottom", "left")
 
@@ -1230,7 +1594,8 @@ def refine_homography(gray_raw, H, model, k1=0.0, k2=0.0, keys=None,
     refine_ink = len(set(model) if keys is None else set(keys)) >= 3
 
     if iters > 0:
-        o_pts, o_nrm = model_edge_samples(model, keys, outer_only=True)
+        o_pts, o_nrm = model_edge_samples(model, keys, outer_only=True) \
+            if REFINE_USE_COARSE else (np.zeros((0, 2)), np.zeros((0, 2)))
         if len(o_pts) >= 12:
             H, k1, k2, _ = _refine_pass(gray_raw, H, k1, k2, o_pts, o_nrm,
                                         max(2, iters // 2), REFINE_COARSE_MM,
@@ -1239,8 +1604,11 @@ def refine_homography(gray_raw, H, model, k1=0.0, k2=0.0, keys=None,
                                       REFINE_SEARCH_MM, refine_dist,
                                       ink, refine_ink)
 
+    # REFINE_SEARCH_MM passed rather than defaulted: the default was bound at
+    # import time, and --target grid moves the global (a 0.6 mm search would
+    # measure almost nothing on a target whose lines are an inch apart)
     p0, nv, off, good = measure_line_offsets(gray_raw, pts, nrm, H, k1, k2,
-                                             ink_mm=ink)
+                                             REFINE_SEARCH_MM, ink_mm=ink)
     if good.sum() >= 12:
         rms = float(np.sqrt(np.mean(off[good] ** 2)))
         ppm = plane_px_per_mm(H, pts[good][::7])
@@ -1280,7 +1648,7 @@ def refine_report(gray_raw, H, model, k1=0.0, k2=0.0, keys=None,
         print("[snap] not enough sample points")
         return
     p0, nv, off, good = measure_line_offsets(gray_raw, pts, nrm, H, k1, k2,
-                                             ink_mm=ink_mm)
+                                             REFINE_SEARCH_MM, ink_mm=ink_mm)
     if good.sum() < 20:
         print("[snap] no lock")
         return
@@ -1659,7 +2027,8 @@ def calibrate(cap, model):
             np.savez(CALIB_FILE, H=H, px_per_mm=PX_PER_MM,
                      canvas_w=CANVAS_W, canvas_h=CANVAS_H,
                      k1=k1, k2=k2, model_sig=model_signature(),
-                     cam_w=frame.shape[1], cam_h=frame.shape[0])
+                     cam_w=frame.shape[1], cam_h=frame.shape[0],
+                     target="squares")
             DIST_K1, DIST_K2 = k1, k2
             H_saved = H
             print(f"[calib] homography saved to {CALIB_FILE} "
@@ -1690,6 +2059,319 @@ def calibrate(cap, model):
     return H_saved
 
 
+def calibrate_grid(cap):
+    """Calibrate against the 1-inch ArUco grid.
+
+    Same two stages as calibrate(), and the same keys, but the first stage is
+    the marker detector instead of the square detector plus two trackbars:
+    nothing has to be told which cell is which.
+
+    What is worth watching in the HUD is 'span'. The fit is measured over the
+    block of cells that is in the frame and then used over the whole canvas, so
+    a 50 mm span on a 500 mm canvas means every measurement is extrapolated
+    tenfold, and a tenth of a pixel of corner noise becomes a millimetre out at
+    the far corner. That is not a flaw to be tuned away, it is what a close-up
+    view can know - and it matters much less than it sounds, because the
+    overlay only ever draws over the part of the canvas that IS in the frame.
+    A number to trust for its own sake wants a frame with cells spread across
+    it, not two cells in the middle."""
+    global DIST_K1, DIST_K2
+    cell_model = build_grid_cell_model()
+    marker_model = build_grid_marker_model()
+    cols, rows, base = gt.board_spec(GRID_BOARD)
+
+    win = "calibrate (grid)"
+    make_window(win)
+    k1, k2, kstep = DIST_K1, DIST_K2, DIST_STEP
+    H_saved = None
+    do_refine, refine_dist = True, False
+    if GRID_ANCHOR_FROM_FILE:
+        # The one value that survives a recalibration without being re-measured,
+        # and the only one that a perfect calibration cannot contradict: trim
+        # the board or move it and this number is silently stale, while every
+        # residual in this window still reads beautifully.
+        print(f"[calib] !! MOUNTING OFFSET INHERITED from the previous "
+              f"calibration: the board's bottom-right printed corner is assumed "
+              f"to be ({GRID_ANCHOR_X_MM:+.1f}, {GRID_ANCHOR_Y_MM:+.1f}) mm from "
+              f"the canvas corner.\n"
+              f"        Nothing here can check that. If you have trimmed, moved "
+              f"or remounted the board since, re-measure it - or pass\n"
+              f"        --grid-anchor-x 0 --grid-anchor-y 0 if the printed "
+              f"border is now flush with the canvas edges.")
+    elif GRID_ANCHOR_X_MM or GRID_ANCHOR_Y_MM:
+        print(f"[calib] the board's bottom-right printed corner is taken to be "
+              f"({GRID_ANCHOR_X_MM:+.1f}, {GRID_ANCHOR_Y_MM:+.1f}) mm from the "
+              f"canvas corner.")
+    else:
+        print("[calib] the board's bottom-right printed corner is taken to be "
+              "EXACTLY the canvas corner. If the paper margins are still on and "
+              "the border stops short of the edge, measure the two gaps and pass "
+              "--grid-anchor-x/-y (negative) - nothing in the frame can catch "
+              "this for you.")
+    print(f"[calib] {GRID_BOARD} grid: {cols}x{rows} cells of "
+          f"{gt.CELL_MM:.1f} mm, marker ids {base}..{base + cols * rows - 1}.\n"
+          "        Aim anywhere on the board - two or three cells are enough.\n"
+          "        Green outlines are recognised markers, labelled with the\n"
+          "        cell they are; cyan is the fitted grid snapped onto the ink,\n"
+          "        and 'snap' is how far it still misses, in mm on the paper.\n"
+          "        'a' auto-fits the lens distortion, 1/2 3/4 tune k1/k2 by\n"
+          "        hand, 5/6 change the step, 0 resets it, 'e' toggles the\n"
+          "        snap, 'r' lets it retune k1/k2, 'v' reports, 'c' saves.")
+
+    while True:
+        raw = read_frame(cap)
+        if raw is None:
+            print("[calib] no frame"); break
+        frame = undistort(raw, k1, k2)
+        vis = frame.copy()
+        gray_raw = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
+
+        found, foreign, clipped = detect_grid_cells(raw, k1, k2)
+        H_mark, matches = compute_homography_markers(found, marker_model)
+        rejected = len(found) - len(matches)
+        keys = set((c, r) for (c, r, _) in matches)
+
+        H_live, rinfo = None, {"ok": False}
+        if do_refine and H_mark is not None:
+            H_live, nk1, nk2, rinfo = refine_homography(
+                gray_raw, H_mark, cell_model, k1, k2, keys=keys,
+                refine_dist=refine_dist)
+            if rinfo["ok"]:
+                k1, k2 = nk1, nk2      # settles over a few frames, as in calibrate()
+            else:
+                H_live = None
+        H_show = H_live if H_live is not None else H_mark
+
+        for (col, row, quad) in found:
+            ok = any((c, r) == (col, row) for (c, r, _) in matches)
+            cv2.polylines(vis, [np.round(quad).astype(np.int32)], True,
+                          (0, 220, 0) if ok else (0, 0, 255), 2, cv2.LINE_AA)
+        for (col, row, quad) in matches:
+            cv2.circle(vis, tuple(np.round(quad[0]).astype(int)), 5,
+                       (255, 0, 0), -1)          # the marker's top-left corner
+            cen = np.round(quad.mean(axis=0)).astype(int)
+            cv2.putText(vis, f"{col},{row}", tuple(cen), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 220, 0), 2, cv2.LINE_AA)
+        draw_grid_overlay(vis, H_show, cell_model, matches)
+
+        n, nc, nr, span = grid_view_span(matches)
+        reach = np.hypot(CANVAS_W, CANVAS_H) / max(span, 1e-6)
+        hud = [f"markers={n} over {nc}x{nr} cells  span={span:.0f}mm "
+               f"(x{reach:.1f} of the canvas diagonal)"
+               f"{f'  [{rejected} disagreed]' if rejected else ''}"
+               f"{f'  [{clipped} at the frame edge]' if clipped else ''}"
+               f"{f'  [{foreign} not on the {GRID_BOARD} board]' if foreign else ''}"
+               f"{'' if H_mark is not None else '  [no marker - no fit]'}",
+               f"k1={k1:+.4f} k2={k2:+.4f} step={kstep:.4f}   board={GRID_BOARD}"
+               f"   board corner at ({GRID_ANCHOR_X_MM:+.0f},{GRID_ANCHOR_Y_MM:+.0f})mm"
+               f" from the canvas corner",
+               (f"snap={rinfo['rms_mm']:.3f} mm ({rinfo['rms_px']:.2f} px) on "
+                f"{rinfo['n']}/{rinfo['n_total']} pts  "
+                f"ink={2 * rinfo['ink_mm']:.2f}mm"
+                f"{'  +k1k2' if refine_dist else ''}"
+                if rinfo["ok"] else
+                ("snap: no lock" if do_refine else "snap: off")),
+               "1/2 k1  3/4 k2  5/6 step  a auto-fit dist  0 reset dist  "
+               "e refine  r +k1k2  v report  c save  q quit"]
+        y = 30
+        for ln in hud:
+            cv2.putText(vis, ln, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                        (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(vis, ln, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                        (0, 255, 255), 2, cv2.LINE_AA)
+            y += 32
+
+        cv2.imshow(win, vis)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord('q'), 27):
+            break
+        elif key == ord('1'):
+            k1 -= kstep
+        elif key == ord('2'):
+            k1 += kstep
+        elif key == ord('3'):
+            k2 -= kstep
+        elif key == ord('4'):
+            k2 += kstep
+        elif key == ord('5'):
+            kstep = max(1e-5, kstep / 2.0)
+        elif key == ord('6'):
+            kstep = min(1.0, kstep * 2.0)
+        elif key == ord('0'):
+            k1 = k2 = 0.0
+        elif key == ord('e'):
+            do_refine = not do_refine
+        elif key == ord('r'):
+            refine_dist = not refine_dist
+        elif key == ord('v') and H_show is not None:
+            refine_report(gray_raw, H_show, cell_model, k1, k2, keys=keys,
+                          frame=raw, ink_mm=rinfo.get("ink_mm"))
+        elif key == ord('a'):
+            # the marker corners stand in for the square corners here: markers
+            # in one row of cells have collinear top edges, markers in one
+            # column have collinear left edges, which is all the residual needs
+            if len(matches) >= 2:
+                nk1, nk2, r = auto_distortion(matches, frame.shape[1],
+                                              frame.shape[0], k1, k2)
+                print(f"[calib] auto distortion: k1={nk1:+.4f} k2={nk2:+.4f} "
+                      f"(line residual -> {r:.3f} px, over {len(matches)} markers)")
+                k1, k2 = nk1, nk2
+            else:
+                print("[calib] auto distortion needs at least 2 markers in view "
+                      "(and really wants them spread across the frame).")
+
+        if key == ord('c'):
+            if H_mark is None:
+                print("[calib] no marker in view - nothing to fit.")
+                continue
+            H = H_mark
+            if do_refine:
+                _, _, _, before = refine_homography(gray_raw, H, cell_model,
+                                                    k1, k2, keys, iters=0)
+                Hr, k1r, k2r, after = refine_homography(
+                    gray_raw, H, cell_model, k1, k2, keys,
+                    refine_dist=refine_dist)
+                if after["ok"]:
+                    print(f"[calib] line snap: {before['rms_mm']:.3f} -> "
+                          f"{after['rms_mm']:.3f} mm "
+                          f"({before['rms_px']:.2f} -> {after['rms_px']:.2f} px, "
+                          f"{after['n']}/{after['n_total']} sample points)")
+                    if after["rms_mm"] > 0.15:
+                        print("[calib] NOTE: >0.15 mm left after the snap. On "
+                              "this target that usually means the print was "
+                              "scaled (measure the 100 mm ruler on the sheet), "
+                              "the paper is not flat, or k1/k2 still have work "
+                              "left - try 'a' then 'r'.")
+                    H, k1, k2 = Hr, k1r, k2r
+                else:
+                    print("[calib] line snap: no lock (too few usable samples) "
+                          "- saving the marker fit alone, which is worth much "
+                          "less. Get more of the grid into the frame.")
+            np.savez(CALIB_FILE, H=H, px_per_mm=PX_PER_MM,
+                     canvas_w=CANVAS_W, canvas_h=CANVAS_H,
+                     k1=k1, k2=k2, model_sig=model_signature(),
+                     cam_w=frame.shape[1], cam_h=frame.shape[0],
+                     target="grid", board=GRID_BOARD,
+                     grid_anchor=np.array([GRID_ANCHOR_X_MM, GRID_ANCHOR_Y_MM]))
+            DIST_K1, DIST_K2 = k1, k2
+            H_saved = H
+            n, nc, nr, span = grid_view_span(matches)
+            print(f"[calib] homography saved to {CALIB_FILE} "
+                  f"(grid {GRID_BOARD}, {n} markers over {nc}x{nr} cells, "
+                  f"span {span:.0f} mm, k1={k1:+.4f} k2={k2:+.4f})")
+            print(f"[calib] marker reprojection error: "
+                  f"{reprojection_error(matches, marker_model, H):.2f} px")
+            if span < 0.35 * np.hypot(CANVAS_W, CANVAS_H):
+                print(f"[calib] NOTE: the fit spans {span:.0f} mm of a "
+                      f"{np.hypot(CANVAS_W, CANVAS_H):.0f} mm canvas diagonal. "
+                      f"It is exact where you measured it and extrapolated "
+                      f"everywhere else - fine if the overlay only has to land "
+                      f"inside the frame, not if you need the far corner.")
+            break
+
+    cv2.destroyWindow(win)
+    return H_saved
+
+
+def grid_probe(frame, out="grid_probe.png"):
+    """Say WHY the grid is not being recognised, instead of showing markers=0.
+
+    detectMarkers() fails in three quite different places and the calibrate
+    window cannot tell them apart, because all three look like nothing at all:
+
+      * no candidates - it never found a four-sided dark blob of the right
+        size. The frame is out of focus, too dark, too washed out, or the
+        markers are simply too few pixels across.
+      * candidates but no decode - it found the squares and could not read the
+        bits. That is resolution or blur: a 4x4 marker has 6 modules a side and
+        needs roughly 4-5 px per module, so about 30 px of marker side, and
+        real optics want more.
+      * decoded, wrong board - the ids came out fine but belong to the other
+        printed board, i.e. --board names the wrong sheet.
+
+    The rejected-candidate count is the one number that separates the first two,
+    and it is right there in the detector's third return value."""
+    cols, rows, base = gt.board_spec(GRID_BOARD)
+    gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+    lap = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    print(f"[probe] frame {w}x{h}  gray min/mean/max "
+          f"{gray.min()}/{gray.mean():.0f}/{gray.max()}  focus(lapvar) {lap:.0f}"
+          + ("   <- LOW: out of focus, or the frame is flat/dark"
+             if lap < 60 else ""))
+    print(f"[probe] configured board: {GRID_BOARD} = {cols}x{rows} cells, "
+          f"ids {base}..{base + cols * rows - 1}, "
+          f"{gt.MARKER_MM} mm markers in {gt.CELL_MM} mm cells")
+
+    corners, ids, rejected = aruco_detector().detectMarkers(gray)
+    n_rej = 0 if rejected is None else len(rejected)
+    ids = np.zeros(0, np.int32) if ids is None else ids.reshape(-1)
+    print(f"[probe] tuned detector: {len(ids)} decoded, {n_rej} candidates "
+          f"rejected before decoding")
+
+    # the stock detector too - if the tuning is what is losing them, this says so
+    d_corners, d_ids, d_rej = cv2.aruco.ArucoDetector(
+        gt.aruco_dictionary(), cv2.aruco.DetectorParameters()).detectMarkers(gray)
+    print(f"[probe] stock detector: "
+          f"{0 if d_ids is None else len(d_ids)} decoded, "
+          f"{0 if d_rej is None else len(d_rej)} rejected")
+
+    if len(ids):
+        sides = [float(np.mean([np.linalg.norm(q.reshape(4, 2)[i] -
+                                               q.reshape(4, 2)[(i + 1) % 4])
+                                for i in range(4)])) for q in corners]
+        on, off = [], []
+        for mid in ids:
+            (on if gt.cell_of_id(int(mid), cols, rows, base) else off).append(int(mid))
+        print(f"[probe] marker side in px: min {min(sides):.0f} "
+              f"median {np.median(sides):.0f} max {max(sides):.0f}"
+              + ("   <- SMALL: under ~30 px a 4x4 marker is a coin toss"
+                 if min(sides) < 30 else ""))
+        print(f"[probe] {len(on)} ids on the {GRID_BOARD} board, {len(off)} not")
+        if off:
+            other = [n for n, (c, r, b) in gt.BOARDS.items()
+                     if any(b <= m < b + c * r for m in off)]
+            print(f"[probe] ids not on this board: {sorted(set(off))[:12]}"
+                  + (f"   <- those are the {'/'.join(other)} board(s). "
+                     f"Use --board {other[0]}." if other else
+                     "   <- not on any known board: a misread, or a stray "
+                     "ArUco marker in view."))
+    elif n_rej:
+        print("[probe] squares were found but none decoded - too few pixels per "
+              "module, or too much blur. Move the camera closer, focus it, or "
+              "raise the capture resolution.")
+    else:
+        print("[probe] nothing four-sided and dark enough was found at all. "
+              "Is the grid actually in view, printed, and lit? Check "
+              f"{out} to see what the camera sees.")
+
+    # ...and finally what calibrate actually gets, i.e. after the filters that
+    # detect_grid_cells applies on top of the raw detection. The two numbers
+    # differing is not a discrepancy, it is the filters doing their job - but
+    # it is the second one that appears in the calibrate window.
+    kept, foreign, clipped = detect_grid_cells(frame)
+    print(f"[probe] calibrate would use {len(kept)} of them"
+          + (f"  ({clipped} dropped at the frame edge)" if clipped else "")
+          + (f"  ({foreign} on another board)" if foreign else "")
+          + (f"  cells {sorted((c, r) for (c, r, _) in kept)[:8]}" if kept else ""))
+
+    vis = frame.copy() if frame.ndim == 3 else cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    if rejected is not None:
+        for q in rejected:
+            cv2.polylines(vis, [np.round(q).astype(np.int32)], True,
+                          (0, 0, 255), 2, cv2.LINE_AA)
+    for q, mid in zip(corners, ids):
+        ok = gt.cell_of_id(int(mid), cols, rows, base)
+        cv2.polylines(vis, [np.round(q).astype(np.int32)], True,
+                      (0, 220, 0) if ok else (0, 160, 255), 3, cv2.LINE_AA)
+        cv2.putText(vis, str(int(mid)),
+                    tuple(np.round(q.reshape(4, 2).mean(axis=0)).astype(int)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 0), 2, cv2.LINE_AA)
+    cv2.imwrite(out, vis)
+    print(f"[probe] green = decoded and on the board, orange = decoded but not, "
+          f"red = candidate that would not decode  ->  {out}")
+
+
 def reprojection_error(matches, model, H):
     errs = []
     for (col, row, quad) in matches:
@@ -1706,6 +2388,8 @@ def reprojection_error(matches, model, H):
 # ==========================================================================
 CALIB_CAM_W = 0                    # capture size H was fitted at (0 = unknown)
 CALIB_CAM_H = 0
+TARGET_EXPLICIT = False            # --target was given, do not let a file override
+_SIG_WARNED = False
 
 
 def model_signature():
@@ -1723,12 +2407,28 @@ def load_calibration():
 
     The capture size H was fitted at lands in CALIB_CAM_W/H: H is in pixels, so
     it only means anything together with the resolution that produced it (see
-    scale_homography)."""
-    global DIST_K1, DIST_K2, CALIB_CAM_W, CALIB_CAM_H
+    scale_homography).
+
+    The file also says which TARGET it was made with, and that is adopted
+    unless --target said otherwise - a calibration and the target it was fitted
+    to are one object, and making the user repeat the flag on every run just
+    invites the two to be paired up wrong."""
+    global DIST_K1, DIST_K2, CALIB_CAM_W, CALIB_CAM_H, _SIG_WARNED
     try:
         data = np.load(CALIB_FILE)
     except FileNotFoundError:
         return None
+    global GRID_ANCHOR_X_MM, GRID_ANCHOR_Y_MM, GRID_ANCHOR_FROM_FILE
+    if not TARGET_EXPLICIT and "target" in data and str(data["target"]) == "grid":
+        if TARGET != "grid":
+            use_grid_target(str(data["board"]) if "board" in data else None)
+            print(f"[calib] {CALIB_FILE} was made with the {GRID_BOARD} grid "
+                  f"target - using it (--target squares overrides).")
+    # the mounting offset travels with the calibration for the same reason the
+    # board does: the two only mean anything together
+    if not GRID_ANCHOR_EXPLICIT and "grid_anchor" in data:
+        GRID_ANCHOR_X_MM, GRID_ANCHOR_Y_MM = (float(v) for v in data["grid_anchor"])
+        GRID_ANCHOR_FROM_FILE = bool(GRID_ANCHOR_X_MM or GRID_ANCHOR_Y_MM)
     DIST_K1 = float(data["k1"]) if "k1" in data else 0.0
     DIST_K2 = float(data["k2"]) if "k2" in data else 0.0
     CALIB_CAM_W = int(data["cam_w"]) if "cam_w" in data else 0
@@ -1738,9 +2438,11 @@ def load_calibration():
     sig = model_signature()
     old = data["model_sig"] if "model_sig" in data else None
     if old is None or old.shape != sig.shape or not np.allclose(old, sig, atol=1e-3):
-        print(f"[calib] WARNING: {CALIB_FILE} was made with a different sheet "
-              f"geometry than the one configured now - recalibrate, or the "
-              f"reference will land a millimetre or two out.")
+        if not _SIG_WARNED:
+            _SIG_WARNED = True
+            print(f"[calib] WARNING: {CALIB_FILE} was made with a different "
+                  f"target geometry than the one configured now - recalibrate, "
+                  f"or the reference will land a millimetre or two out.")
     return data["H"]
 
 
@@ -1764,11 +2466,16 @@ def scale_homography(H, from_wh, to_wh):
     return np.diag([sx, sy, 1.0]) @ H
 
 
+def run_calibrate(cap, model):
+    """Whichever calibration the configured target calls for."""
+    return calibrate_grid(cap) if TARGET == "grid" else calibrate(cap, model)
+
+
 def run(cap, model):
     H = load_calibration()
     if H is None:
         print(f"[run] no {CALIB_FILE} - run calibrate first.")
-        H = calibrate(cap, model)
+        H = run_calibrate(cap, model)
         if H is None:
             return
     A, out_w, out_h = output_transform()
@@ -1798,7 +2505,7 @@ def run(cap, model):
             show_grid = not show_grid
         if key == ord('c'):
             cv2.destroyWindow(win)
-            newH = calibrate(cap, model)
+            newH = run_calibrate(cap, model)
             if newH is not None:
                 H = newH
                 M = H @ A
@@ -2047,6 +2754,19 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
     if not load_ref(0):
         return
     dx, dy, sx, sy, theta, alpha = load_overlay_adjust(adjust_path)
+    if (dx, dy, sx, sy, theta) != (0.0, 0.0, 1.0, 1.0, 0.0):
+        # An adjustment tuned for one reference on one day is applied to every
+        # reference forever after, silently, because it lives in a file that is
+        # loaded by default. It is then indistinguishable from a calibration
+        # error - and it invites being "fixed" somewhere else, which buries two
+        # errors that cancel only in whatever check happened to be on screen.
+        print(f"[overlay] NOTE: a saved adjustment was loaded from {adjust_path} "
+              f"and is applied to EVERY reference:\n"
+              f"          dx={dx:+.1f}mm dy={dy:+.1f}mm sx={sx:.3f} sy={sy:.3f} "
+              f"rot={theta:+.1f}deg\n"
+              f"          If the reference lands offset and you did not put it "
+              f"there, this is why. Press 'i' to zero it (then 'p' to save), or "
+              f"pass --adjust with a fresh file.")
     color_i = 0
     show = True
     show_help = True
@@ -2285,8 +3005,9 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
                    f"  cam={fw}x{fh}"
                    + ("" if (fw, fh) == (calib_w, calib_h) else " (scaled H)")
                    + f"  {fps:.1f} fps",
-                   "w/a/s/d move  z/x scale  [ ] X  - = Y  ,/. rot  m mode  9/0 alpha  "
-                   "1/2 3/4 canny  5/6 delta thr  n snap  t delta  v cam res  <-/-> ref"]
+                   "w/a/s/d move  z/x scale  [ ] X  - = Y  ,/. rot  i RESET adj  "
+                   "p save adj  m mode  9/0 alpha  1/2 3/4 canny  5/6 delta thr  "
+                   "n snap  t delta  v cam res  <-/-> ref"]
             y0 = 26
             for ln in hud:
                 cv2.putText(disp, ln, (10, y0), cv2.FONT_HERSHEY_SIMPLEX,
@@ -2436,6 +3157,26 @@ def generate_template(out_path, ppm=4.0):
     for (col, row), corners in model.items():
         pts = np.array([world_to_template_px(p, ppm) for p in corners], np.int32)
         cv2.polylines(img, [pts], True, (0, 0, 0), th, cv2.LINE_AA)
+    if TARGET == "grid":
+        # the markers too, so the template is the whole printed sheet and not
+        # just its lines - overlaid on the real one, a marker that lands half a
+        # cell off is a great deal easier to see than a line that does
+        cols, rows, base = gt.board_spec(GRID_BOARD)
+        ox, oy = grid_origin_mm()
+        m = gt.MARKER_MM / gt.ARUCO_MODULES
+        for row in range(rows):
+            for col in range(cols):
+                bits = gt.marker_bits(gt.marker_id(col, row, cols, base))
+                mx, my, _, _ = gt.marker_rect_mm(col, row)
+                for r in range(gt.ARUCO_MODULES):
+                    for c in range(gt.ARUCO_MODULES):
+                        if not bits[r, c]:
+                            continue
+                        a = world_to_template_px((ox + mx + c * m,
+                                                  oy + my + r * m), ppm)
+                        b = world_to_template_px((ox + mx + (c + 1) * m,
+                                                  oy + my + (r + 1) * m), ppm)
+                        cv2.rectangle(img, a, b, (0, 0, 0), -1)
     # canvas border to make the proportions clear
     cv2.rectangle(img, (0, 0), (W - 1, H - 1), (0, 0, 0), th)
     cv2.imwrite(out_path, img)
@@ -2484,8 +3225,10 @@ def list_devices():
 def main():
     global PX_PER_MM, CANVAS_W, CANVAS_H, REQ_WIDTH, REQ_HEIGHT, DISPLAY_MAX
     global FIT_MODE, DIST_K1, DIST_K2, FULLSCREEN, DISPLAY_TARGET, KEEP_AWAKE
+    global TARGET_EXPLICIT, GRID_ANCHOR_X_MM, GRID_ANCHOR_Y_MM, GRID_ANCHOR_EXPLICIT
     ap = argparse.ArgumentParser(description="Canvas perspective calibration/rectification")
-    ap.add_argument("mode", choices=["calibrate", "run", "overlay", "gen-template", "list"])
+    ap.add_argument("mode", choices=["calibrate", "run", "overlay", "gen-template",
+                                     "grid-probe", "list"])
     ap.add_argument("--cam", type=int, default=CAM_INDEX)
     ap.add_argument("--width", type=int, default=None,
                     help=f"capture width (default {REQ_WIDTH})")
@@ -2501,7 +3244,30 @@ def main():
                     help="canvas width in inches (the sheet is always bottom-right)")
     ap.add_argument("--canvas-h-in", type=float, default=None,
                     help="canvas height in inches")
-    ap.add_argument("--out", default=None, help="output file for gen-template")
+    ap.add_argument("--target", choices=["squares", "grid"], default=None,
+                    help="which printed target: 'squares' = the six 63 mm "
+                         "squares of calibr.svg (the default), 'grid' = the "
+                         "1-inch ArUco grid from templates/ (see gridtarget.py). "
+                         "Without this the target saved in the calibration file "
+                         "is used.")
+    ap.add_argument("--grid-anchor-x", type=float, default=None,
+                    help="mm from the canvas RIGHT edge to the board's right "
+                         "printed border, as a negative number (e.g. -10 if the "
+                         "board stops 10 mm short of the edge). 0 = flush.")
+    ap.add_argument("--grid-anchor-y", type=float, default=None,
+                    help="the same for the canvas BOTTOM edge and the board's "
+                         "bottom border. Both change the model, so recalibrate "
+                         "after setting them.")
+    ap.add_argument("--board", default=None,
+                    help=f"which printed grid ({', '.join(gt.BOARDS)}); implies "
+                         f"--target grid. The board is canvas-sized, so it also "
+                         f"sets the canvas unless --canvas-w-in/-h-in say "
+                         f"otherwise")
+    ap.add_argument("--out", default=None,
+                    help="output file for gen-template / grid-probe")
+    ap.add_argument("--frame", default=None,
+                    help="for grid-probe: analyse this image file instead of "
+                         "grabbing a frame from the camera")
     ap.add_argument("--ppm", type=float, default=4.0,
                     help="pixels per mm for gen-template (default 4.0)")
     ap.add_argument("--adjust", default=OVERLAY_ADJUST_FILE,
@@ -2536,19 +3302,35 @@ def main():
         PX_PER_MM = args.px_per_mm
     if args.view_max:
         DISPLAY_MAX = args.view_max
-    if args.canvas_w_in:
-        CANVAS_W = args.canvas_w_in * MM_PER_IN
-    if args.canvas_h_in:
-        CANVAS_H = args.canvas_h_in * MM_PER_IN
     if args.fit:
         FIT_MODE = args.fit
     FULLSCREEN = args.fullscreen
     DISPLAY_TARGET = args.display
     KEEP_AWAKE = not args.no_keep_awake
-    # start calibration from the distortion tuned last time instead of from
-    # zero, so recalibrating does not throw the lens settings away
-    if args.mode == "calibrate":
+
+    # --- which target, and therefore which model everything below builds ---
+    if args.target or args.board:
+        TARGET_EXPLICIT = True
+        if args.target == "grid" or (args.board and args.target != "squares"):
+            use_grid_target(args.board)
+    if args.grid_anchor_x is not None:
+        GRID_ANCHOR_X_MM, GRID_ANCHOR_EXPLICIT = args.grid_anchor_x, True
+    if args.grid_anchor_y is not None:
+        GRID_ANCHOR_Y_MM, GRID_ANCHOR_EXPLICIT = args.grid_anchor_y, True
+    # The saved calibration names its own target, and it has to be read before
+    # anything asks build_model() - a model built for the wrong target would
+    # only announce itself as a signature mismatch, several steps too late.
+    # It also carries the lens distortion tuned last time, so recalibrating
+    # does not throw the lens settings away.
+    if args.mode in ("calibrate", "run", "overlay"):
         load_calibration()
+    # the grid board IS the canvas, so it sets the canvas size by default
+    if TARGET == "grid" and not (args.canvas_w_in or args.canvas_h_in):
+        CANVAS_W, CANVAS_H = gt.board_size_mm(GRID_BOARD)
+    if args.canvas_w_in:
+        CANVAS_W = args.canvas_w_in * MM_PER_IN
+    if args.canvas_h_in:
+        CANVAS_H = args.canvas_h_in * MM_PER_IN
     if args.k1 is not None:
         DIST_K1 = args.k1
     if args.k2 is not None:
@@ -2560,13 +3342,33 @@ def main():
     if args.mode == "gen-template":
         generate_template(args.out or "calib_template.png", args.ppm)
         return
+    if args.mode == "grid-probe":
+        if TARGET != "grid":
+            use_grid_target(args.board)
+        if args.frame:
+            frame = cv2.imread(args.frame)
+            if frame is None:
+                print(f"[probe] could not read {args.frame}"); return
+            print(f"[probe] reading {args.frame}")
+        else:
+            cap = open_camera(args.cam)
+            try:
+                frame = read_frame(cap)
+            finally:
+                cap.release()
+            if frame is None:
+                print("[probe] no frame from the camera"); return
+            cv2.imwrite("grid_probe_raw.png", frame)
+            print("[probe] frame saved to grid_probe_raw.png")
+        grid_probe(frame, args.out or "grid_probe.png")
+        return
 
     model = build_model()
     awake = KeepAwake(f"artprojector {args.mode}").start() if KEEP_AWAKE else None
     cap = open_camera(args.cam)
     try:
         if args.mode == "calibrate":
-            calibrate(cap, model)
+            run_calibrate(cap, model)
         elif args.mode == "overlay":
             overlay(cap, args.ref, args.adjust)
         else:

@@ -15,12 +15,24 @@ canvas corner would land from where it belongs, in millimetres on the canvas.
 The point of the test is that the ground truth is a homography the test picked,
 so nothing in the measurement chain can quietly agree with itself: a bias in
 the detector or a wrong square size shows up as millimetres at the corners.
+
+  python synthtest.py --target grid --n 20        # the ArUco grid instead
+  python synthtest.py --target grid --dist 90     # ...seen from 9 cm away
+
+The grid runs are stricter still, because the scene is not rendered from the
+model at all: it is the PRINTED PDF out of templates/, rasterised. If
+gridtarget.py and artprojector.py ever disagree about where a marker or a line
+is, that shows up here as millimetres, which is the one way the two can be
+held to the same geometry.
 """
 import argparse
+import os
+import subprocess
 import numpy as np
 import cv2
 
 import artprojector as ap
+import gridtarget as gt
 
 
 def render_scene(H_true, k1, k2, w, h, ppm=8.0, blur=1.2, noise=2.0,
@@ -64,6 +76,163 @@ def render_scene(H_true, k1, k2, w, h, ppm=8.0, blur=1.2, noise=2.0,
                           p[:, 1].reshape(h, w).astype(np.float32),
                           cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     return frame
+
+
+_SHEET_CACHE = {}
+
+
+def rasterize_board(board, ppm, pdf=None):
+    """The printed PDF as pixels -> (image, px_per_mm actually achieved).
+
+    Rendering the real PDF instead of re-drawing the board from the model is
+    the whole point of the grid test: the marker bits, the 4.7 mm clear ring,
+    the line width and the 1-inch pitch all come from the file that goes to the
+    printer, so a disagreement between the generator and the detector cannot
+    cancel out."""
+    pdf = pdf or os.path.join("templates", f"grid-{board}-full.pdf")
+    key = (pdf, round(ppm, 4))
+    if key in _SHEET_CACHE:
+        return _SHEET_CACHE[key]
+    if not os.path.exists(pdf):
+        raise SystemExit(f"{pdf} not found - run `python gridtarget.py` first")
+    out = f"/tmp/synthtest-{board}-{ppm:.2f}"
+    subprocess.run(["pdftoppm", "-r", f"{ppm * 25.4:.6f}", "-png", "-gray",
+                    "-singlefile", pdf, out], check=True)
+    img = cv2.imread(out + ".png", cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise SystemExit(f"could not rasterise {pdf}")
+    # ppm is exactly what was asked for: pdftoppm honours -r and rounds the
+    # image size UP, so deriving the scale back from img.shape would be off by
+    # the rounding. Getting this wrong is not academic - it silently rescales
+    # the whole ground truth and every error below inherits it.
+    _SHEET_CACHE[key] = (img, ppm)
+    return _SHEET_CACHE[key]
+
+
+def render_grid_scene(H_true, k1, k2, w, h, ppm=8.0, blur=1.2, noise=2.0,
+                      paper=232, ink=28, seed=0, board=None):
+    """A camera frame of the printed grid, warped by H_true and distorted."""
+    rng = np.random.default_rng(seed)
+    board = board or ap.GRID_BOARD
+    sheet, real_ppm = rasterize_board(board, ppm)
+    # paper white -> the paper grey, ink black -> the ink grey
+    sheet = (ink + sheet.astype(np.float32) * (paper - ink) / 255.0)
+    sheet = cv2.cvtColor(sheet.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    sh, sw = sheet.shape[:2]
+    # Sheet pixel -> world mm. The half pixel is not a fudge: the rasteriser
+    # maps board mm 0 to the left EDGE of pixel 0, while OpenCV puts pixel 0 at
+    # coordinate 0, i.e. at its centre. Without it the whole ground truth sits
+    # half a sheet pixel off and every fit below is condemned to be exactly
+    # that wrong, which at 8 px/mm is 0.06 mm of pure bookkeeping.
+    ox, oy = ap.grid_origin_mm()
+    S = np.array([[1 / real_ppm, 0, ox + 0.5 / real_ppm],
+                  [0, 1 / real_ppm, oy + 0.5 / real_ppm],
+                  [0, 0, 1.0]])
+
+    frame = cv2.GaussianBlur(rng.integers(40, 110, (h, w, 3)).astype(np.uint8),
+                             (0, 0), 25)
+    warped = cv2.warpPerspective(sheet, H_true @ S, (w, h), flags=cv2.INTER_AREA)
+    mask = cv2.warpPerspective(np.full((sh, sw), 255, np.uint8), H_true @ S,
+                               (w, h), flags=cv2.INTER_AREA)
+    frame[mask > 127] = warped[mask > 127]
+    if blur:
+        frame = cv2.GaussianBlur(frame, (0, 0), blur)
+    if noise:
+        frame = np.clip(frame + rng.normal(0, noise, frame.shape), 0,
+                        255).astype(np.uint8)
+    if k1 or k2:
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        p = ap.undistort_points(np.stack([xx.ravel(), yy.ravel()], 1), k1, k2, w, h)
+        frame = cv2.remap(frame, p[:, 0].reshape(h, w).astype(np.float32),
+                          p[:, 1].reshape(h, w).astype(np.float32),
+                          cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return frame
+
+
+def aim_homography(w, h, yaw, pitch, roll, dist_mm, aim_mm):
+    """Like scene_homography, but pointed at a chosen world point.
+
+    dist_mm doubles as the framing: with f pinned to max(w,h) the frame covers
+    roughly dist_mm across its long side, so dist=90 is a close-up of three or
+    four cells and dist=700 takes in a whole 16x20 board."""
+    f = float(max(w, h))
+    K = np.array([[f, 0, w / 2.0], [0, f, h / 2.0], [0, 0, 1.0]])
+    R, _ = cv2.Rodrigues(np.deg2rad([pitch, yaw, roll]).astype(np.float64))
+    t = np.array([[0.0], [0.0], [dist_mm]])
+    Rt = np.hstack([R[:, :2],
+                    R @ np.array([[-aim_mm[0]], [-aim_mm[1]], [0.0]]) + t])
+    H = K @ Rt
+    return H / H[2, 2]
+
+
+def run_one_grid(seed, w=2592, h=1944, k1=-0.19, k2=0.02, dist=None,
+                 verbose=True, blur=1.2, ink=28, noise=2.0):
+    """One grid viewpoint, end to end. Returns (marker-only, refined, info)."""
+    rng = np.random.default_rng(seed)
+    cell_model = ap.build_grid_cell_model()
+    marker_model = ap.build_grid_marker_model()
+    cols, rows, _ = gt.board_spec(ap.GRID_BOARD)
+
+    yaw = rng.uniform(-35, 35); pitch = rng.uniform(-30, 30)
+    roll = rng.uniform(-8, 8)
+    d = dist if dist else rng.uniform(90, 700)
+    # aim somewhere on the board, keeping the aim point off the very edge so a
+    # close-up still has cells all round it
+    aim = (rng.uniform(1.5, cols - 1.5) * gt.CELL_MM - cols * gt.CELL_MM,
+           rng.uniform(1.5, rows - 1.5) * gt.CELL_MM - rows * gt.CELL_MM)
+    H_true = aim_homography(w, h, yaw, pitch, roll, d, aim)
+    frame = render_grid_scene(H_true, k1, k2, w, h, seed=seed, blur=blur,
+                              ink=ink, noise=noise)
+
+    # --- the pipeline, as calibrate_grid() runs it ---
+    matches, foreign, clipped = ap.detect_grid_cells(frame, k1, k2)
+    if not matches:
+        if verbose:
+            print(f"  seed {seed}: no marker detected (d={d:.0f}mm) - skipped")
+        return None
+    # Every detected cell must be the cell it really is: a mis-decode is not a
+    # millimetre error, it is a 25 mm one, and it must never pass silently. The
+    # bar is a fraction of the marker's own size, because that is the scale a
+    # real mis-identification has - the nearest wrong answer is a whole cell
+    # away, i.e. 160% of a marker side. `worst` reports the corner error itself
+    # separately, which is the quantity that is merely accuracy: ArUco puts the
+    # boundary of a blurred marker a pixel or two inside the ink, and that is
+    # what the line snap afterwards is for.
+    wrong, worst = [], 0.0
+    for (col, row, quad) in matches:
+        truth = marker_model[(col, row)]
+        p = np.hstack([truth, np.ones((4, 1))]) @ H_true.T
+        p = p[:, :2] / p[:, 2:3]          # H_true is in undistorted px, as is quad
+        e = np.linalg.norm(p - quad, axis=1).max()
+        side = np.linalg.norm(p[1] - p[0])
+        worst = max(worst, e)
+        if e > 0.4 * side:
+            wrong.append((col, row))
+    H_mark, matches = ap.compute_homography_markers(matches, marker_model)
+    keys = set((c, r) for (c, r, _) in matches)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    H_ref, rk1, rk2, info = ap.refine_homography(gray, H_mark, cell_model,
+                                                 k1, k2, keys=keys)
+
+    e_mark = canvas_error(H_true, H_mark)
+    e_ref = canvas_error(H_true, H_ref)
+    # error over the cells actually in view - what the overlay draws on
+    seen = np.vstack([cell_model[k] for k in keys]).astype(np.float64)
+    s_mark = canvas_error(H_true, H_mark, seen)
+    s_ref = canvas_error(H_true, H_ref, seen)
+    n, nc, nr, span = ap.grid_view_span(matches)
+    if verbose:
+        print(f"  seed {seed}: yaw={yaw:+5.1f} pitch={pitch:+5.1f} d={d:3.0f}mm "
+              f" {n} markers over {nc}x{nr} cells (span {span:3.0f}mm)"
+              f"  snap={info['rms_mm']:.3f}mm ({info['n']}/{info['n_total']}pts)"
+              f"  worst marker {worst:.1f}px"
+              + (f"  MIS-ID {wrong}" if wrong else "")
+              + (f"  {clipped} clipped" if clipped else "")
+              + (f"  {foreign} foreign" if foreign else ""))
+        print(f"      in view: markers {s_mark.max():.3f} -> refined "
+              f"{s_ref.max():.3f} mm    whole canvas: {e_mark.max():.3f} -> "
+              f"{e_ref.max():.3f} mm")
+    return s_ref.max(), e_ref.max(), info, bool(wrong), span
 
 
 def scene_homography(w, h, yaw, pitch, roll, dist_mm, seed=0):
@@ -206,7 +375,40 @@ def main():
     p.add_argument("--blur", type=float, default=1.2, help="render blur, px")
     p.add_argument("--ink", type=int, default=28, help="ink gray level")
     p.add_argument("--noise", type=float, default=2.0)
+    p.add_argument("--target", choices=["squares", "grid"], default="squares")
+    p.add_argument("--board", default="16x20", help="which grid board to test")
+    p.add_argument("--dist", type=float, default=None,
+                   help="camera distance in mm; also the width of the frame in "
+                        "mm, so 90 is a 3-cell close-up (default: random)")
     a = p.parse_args()
+
+    if a.target == "grid":
+        ap.use_grid_target(a.board)
+        ap.CANVAS_W, ap.CANVAS_H = gt.board_size_mm(a.board)
+        cols, rows, _ = gt.board_spec(a.board)
+        print(f"scene: templates/grid-{a.board}-full.pdf, rasterised - "
+              f"{cols}x{rows} cells of {gt.CELL_MM} mm, {gt.MARKER_MM} mm "
+              f"markers, {gt.LINE_MM} mm lines (blur {a.blur} px, ink {a.ink})")
+        res = [run_one_grid(s, k1=a.k1, k2=a.k2, dist=a.dist, blur=a.blur,
+                            ink=a.ink, noise=a.noise) for s in range(a.n)]
+        res = [r for r in res if r]
+        if not res:
+            return
+        bad = sum(1 for r in res if r[3])
+        seen = np.array([r[0] for r in res])
+        whole = np.array([r[1] for r in res])
+        snap = np.array([r[2]["rms_mm"] for r in res])
+        print(f"\n{len(res)} scenes, {bad} with a mis-identified cell")
+        print(f"  refined error over the cells in view, mm: "
+              f"mean {seen.mean():.3f}  p95 {np.percentile(seen, 95):.3f}  "
+              f"max {seen.max():.3f}")
+        print(f"  ...extrapolated to the whole canvas, mm: "
+              f"mean {whole.mean():.3f}  p95 {np.percentile(whole, 95):.3f}  "
+              f"max {whole.max():.3f}")
+        print(f"  snap residual, mm: mean {np.nanmean(snap):.3f}  "
+              f"max {np.nanmax(snap):.3f}")
+        return
+
     print(f"scene: the real sheet (square {ap.SQUARE_MM:.3f} mm, stroke "
           f"{ap.STROKE_MM:.3f} mm, block 192.07 x 127.53 mm)")
     print(f"model: {'LEGACY 64 mm grid' if a.legacy else 'the same, from calibr.svg'}"

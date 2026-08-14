@@ -5,18 +5,214 @@ the tool figures out the perspective of the canvas from a printed calibration
 target and can rectify the view or overlay a reference image (as contours or as
 a semi-transparent picture) aligned to the canvas plane.
 
-The camera may sees only part of the canvas. A sheet with a grid of six
-64 mm squares is placed flush with the right and bottom edges of the canvas to calibrate.
-From the squares the tool computes a homography between the image and the
-canvas plane (in millimeters), which is enough to rectify what the camera sees
-and to project a reference onto it.
+The camera may sees only part of the canvas. From the printed target the tool
+computes a homography between the image and the canvas plane (in millimeters),
+which is enough to rectify what the camera sees and to project a reference onto
+it.
+
+There are two printed targets, chosen with `--target`:
+
+| | `--target squares` (default) | `--target grid` |
+|---|---|---|
+| what it is | six 63 mm squares on one A4 sheet (`calibr.svg`) | a 1-inch grid the size of the canvas, ArUco marker in every cell (`templates/*.pdf`) |
+| where it goes | bottom-right corner of the canvas | over the whole canvas |
+| what must be in frame | the whole sheet | any two or three cells |
+| which square is which | set by hand, `col_off`/`row_off` | the marker says |
+| how close can the camera get | far enough to see the sheet | as close as you like |
+
+The old target is untouched and stays the default; a calibration file records
+which target it was made with, so `run` and `overlay` pick the right one on
+their own.
 
 ## Requirements
 
 - Python 3, `numpy`, `opencv-python` (developed with OpenCV 4.13)
 - A USB camera. Development used a GXI-IMX179 board camera on macOS.
 
-## Calibration target
+## Calibration target 2 - the 1-inch ArUco grid (`--target grid`)
+
+```
+python gridtarget.py                  # writes templates/*.pdf
+python gridtarget.py --check          # ...and verifies the tiling (needs pdftoppm)
+python artprojector.py calibrate --target grid --board 16x20
+```
+
+`templates/` gets, for each of 12x16" and 16x20":
+
+- `grid-<size>-full.pdf` - one page, exactly that many inches, for a large printer;
+- `grid-<size>-a4.pdf`, `grid-<size>-letter.pdf` - the same board cut into
+  ordinary sheets (4 sheets for 12x16, 6 for 16x20, on either paper).
+
+The board is a 1-inch grid the size of the canvas, with a 16 mm ArUco marker
+(`DICT_4X4_1000`) centred in every cell. Print at 100%, assemble, and mount it -
+see below. `templates/README.md` (written by the generator) has the assembly
+instructions; every tile also carries a 100 mm ruler to catch a print that was
+scaled to fit the page.
+
+### Mounting: the one thing the target cannot tell you
+
+The reference is the printed **border line**, never the paper edge. A printer
+cannot print to the edge, so the bottom-right sheet keeps ~5 mm of blank paper
+outside the border (`PRINT_MARGIN_MM`), and a large printer adds its own margin
+to the full-size PDF. Tape the sheet down by its paper edge and the board sits a
+centimetre up and to the left of where the software thinks it is.
+
+That error is invisible to everything else. The perspective, the scale and the
+cell identities are all measured off the ink and are perfectly correct; only the
+link between the board and the *canvas* is wrong, and nothing in the frame marks
+the canvas edge. Snap residual, reprojection error and the marker count all stay
+excellent while every millimetre reported is out by a centimetre.
+
+Two ways to make it true:
+
+- **trim** along the printed border on the right and bottom and tape that edge
+  flush to the canvas. Nothing to measure, nothing to configure. Preferred.
+- or **declare it**: measure the gap from the canvas right edge to the board's
+  right border, and from the canvas bottom edge to the board's bottom border,
+  and pass them as negative millimetres (`--grid-anchor-x <-your measurement>
+  --grid-anchor-y <-your measurement>`). Do not copy the numbers out of any
+  example, including this one - they are a property of your easel, and nothing
+  in the software can notice that they are wrong.
+
+  They are saved into `calibration.npz` and **picked up automatically on later
+  runs**, which is convenient until you trim or remount the board, at which
+  point a stale offset survives a recalibration untouched. `calibrate` shouts
+  about an inherited offset for that reason; pass `--grid-anchor-x 0
+  --grid-anchor-y 0` explicitly once the board is flush. They are part of the
+  model, so changing them makes the old calibration stale - `calibrate` again.
+
+**Checking it.** Use `gen-template` output as the overlay reference, not a PDF
+converted to an image:
+
+```
+python artprojector.py gen-template --target grid --board 12x16 --out check.png
+python artprojector.py overlay --target grid --board 12x16 --ref check.png --adjust /tmp/fresh.npz
+```
+
+`check.png` is the whole *canvas* with the board drawn where the model says the
+board is, mounting offset included, so its lines land on the real ones. A
+straight `convert` of `templates/grid-12x16-full.pdf` is the board and nothing
+else, and `overlay` stretches any reference across the whole canvas - so with a
+non-zero mounting offset it is guaranteed to miss, by exactly that offset. That
+is not a calibration error, and chasing it as one wastes an evening.
+
+A leftover **`overlay_adjust.npz`** does the same kind of damage from the other
+side: `overlay` loads `dx/dy/sx/sy/theta` at start-up and applies them to every
+reference, so an 8 mm `dy` tuned for an older sheet silently shifts the new one
+by 8 mm. Check it (`python -c "import numpy;d=numpy.load('overlay_adjust.npz');
+print({k:float(d[k]) for k in d.files})"`) or point `--adjust` at a fresh file.
+
+### Why markers and not counted dots or QR
+
+Counted dots were the first idea and the arithmetic kills them: a 16x20" board
+has 320 cells, and 320 countable dots do not fit in a 25.4 mm cell alongside the
+4.7 mm of blank paper the line snap needs. Splitting the count into row and
+column groups still needs up to 20 dots a group, at which point a dot is about a
+millimetre and a misread is one glance away.
+
+A QR code fits but is the wrong tool: a Version-1 symbol is 21x21 modules, so in
+an 18 mm cell the module is 0.86 mm, and QR decoding is all-or-nothing - at 70
+degrees off-axis with a little motion blur it mostly does not decode.
+
+ArUco is what is built for this. `DICT_4X4_1000` is 6x6 modules including the
+border, so a 16 mm marker has a 2.7 mm module - three times the QR module - the
+detector is designed around the projective distortion of a flat marker seen at
+an angle, and it returns four sub-pixel corners *with* an identity, so one
+marker already pins a homography. It is also in OpenCV already.
+
+### How a two-cell view can be enough
+
+The two features do different jobs, and it is not "markers instead of lines":
+
+- the **markers** are read for identity and for a first homography. Four corners
+  of one 16 mm marker determine one - which is what makes a close-up work at all
+  - but 16 mm is a poor lever for a 400 mm canvas, so it is a starting point.
+- the **grid lines** are what the answer is measured on: `refine_homography()`
+  snaps the fit onto the printed ink exactly as it does for the squares, and the
+  lines are the longest and best-localised features on the sheet.
+
+That is why the marker is 16 mm inside a 25.4 mm cell. The 4.7 mm ring of blank
+paper keeps it out of the ~2 mm the line snap searches through; ink that close
+to a line would be measured *as* the line.
+
+**About the lines bending.** At a short distance and a wide angle the printed
+grid really does curve across the frame, and on two or three cells the curve is
+barely visible - which is exactly why it has to be dealt with rather than
+ignored. It is lens distortion, not perspective (perspective keeps straight
+lines straight), so it belongs in `k1`/`k2` and not in `H`: press `a` to fit
+them to the marker corners, `r` to let the line snap keep refining them. Fitting
+a homography to a bent frame without that buries the bend in `H`, where it comes
+back as millimetres somewhere else on the canvas.
+
+### What it is worth
+
+`synthtest.py --target grid` renders the real PDF out of `templates/`, warps it
+through a known homography with known distortion, and runs the whole pipeline
+over it, so a disagreement between the generator and the detector cannot cancel
+out. Over 30 random viewpoints from 90 to 700 mm (12 of them close-ups with 2-4
+cells in frame), and 50 scenes in total:
+
+- cells identified correctly: **all of them**, in every scene;
+- error where the camera is looking: **0.04 mm mean, 0.08 mm worst** (0.07 /
+  0.12 mm for the 90 mm close-ups);
+- error extrapolated to the *whole* canvas from a close-up: 4 mm mean, 14 mm
+  worst.
+
+That last number is not a defect to tune away, it is what a close-up can know: a
+fit measured over 90 mm and used over 640 mm is extrapolated sevenfold. It
+matters much less than it sounds, because the overlay only ever draws on the
+part of the canvas that is in the frame - but if you want a number to trust
+across the whole canvas, back the camera off so the cells spread across the
+frame. The calibrate window prints the span and warns when it is small.
+
+### When it recognises nothing
+
+`markers=0` in the calibrate window is three different failures wearing the same
+face, so there is a mode that tells them apart:
+
+```
+python artprojector.py grid-probe --board 16x20 --cam 2      # grab a frame and analyse it
+python artprojector.py grid-probe --board 16x20 --frame shot.png
+```
+
+It reports focus and exposure, how many four-sided candidates were found, how
+many of those decoded, the marker size in pixels, and whether the ids belong to
+the board you named - and writes an annotated image (green = decoded and on the
+board, orange = decoded but on the *other* board, red = candidate that would not
+decode). The usual answers, in order of likelihood:
+
+- **decoded, but "not on the 16x20 board"** - `--board` names the wrong sheet.
+  The two boards use disjoint id ranges precisely so this is visible rather than
+  silently wrong.
+- **candidates found, none decoded** - too few pixels per module. A 4x4 marker
+  is 6 modules across and wants ~30 px of side at the very least; get closer,
+  focus, or raise the capture resolution.
+- **no candidates at all** - the grid is not in view, not printed, or not lit.
+
+You do not need the whole board glued together to test recognition: print one
+sheet of the tiling and point the camera at it. Every marker names itself, so
+detection works immediately - only the *geometry* waits until the board is
+assembled and taped to the canvas in the right place.
+
+### Tiling and assembly
+
+The sheets are laid out from the **bottom-right corner of the board outwards**,
+which is the corner everything else in this project measures from. Consequences,
+by design:
+
+- the bottom-right sheet is used exactly as it comes out of the printer - no
+  trimming at all;
+- every other sheet is trimmed along a printed dashed line on its **right and/or
+  bottom** edge and glued **on top** of the sheet it laps over;
+- so all the cutting and gluing happens on the left and the top, and each sheet
+  covers its neighbour's unprintable margin.
+
+Each sheet laps 14 mm over its neighbour and stays 5 mm clear of the paper edge
+(`--overlap`, `--margin`). Sheet labels, instructions and the ruler are printed
+only where they cannot show in the finished board: in the strip the next sheet
+covers, or on paper outside the board.
+
+## Calibration target 1 - the six squares (`--target squares`, default)
 
 Print `calibr.svg` at 100% ("actual size", NOT fit-to-page) and place the sheet
 in the bottom-right corner of the canvas, flush with the right and bottom
@@ -51,6 +247,7 @@ it from the file, not from a photograph.
 ```
 python artprojector.py list                 # list cameras and resolutions
 python artprojector.py calibrate            # detect squares, compute homography
+python artprojector.py calibrate --target grid --board 16x20   # the ArUco grid instead
 python artprojector.py run                  # live rectified (fronto-parallel) view
 python artprojector.py overlay --ref img.jpg  # reference contours/image over the feed
 python artprojector.py overlay --ref ref/nadya111/4/bw  # a folder: arrows switch reference
@@ -59,7 +256,9 @@ python artprojector.py gen-template         # generate a full-canvas target temp
 
 Common options: `--cam N` (camera index, default 0), `--px-per-mm 2.0` (output
 scale), `--ref FILE|DIR` (reference for overlay; a folder is stepped through
-with the arrow keys), `--canvas-w-in 12 --canvas-h-in 16`
+with the arrow keys), `--target squares|grid` and `--board 12x16|16x20` (which
+printed target; `--board` implies `--target grid` and also sets the canvas size,
+since the board is canvas-sized), `--canvas-w-in 12 --canvas-h-in 16`
 (canvas size), `--adjust FILE.npz` (where overlay saves/loads its adjustment),
 `--view-max 2000` (render size of the corrected overlay view),
 `--fit consensus|corners` (how the homography is fitted), `--k1/--k2` (starting
@@ -371,6 +570,14 @@ See the "GEOMETRY CONFIG" block in `artprojector.py`:
 - Square side (`SQUARE_MM`), grid (`COLS`, `ROWS`), gaps (`GAP_X_MM`, `GAP_Y_MM`).
 - Anchoring (`RIGHT_MARGIN_MM`, `BOTTOM_MARGIN_MM`).
 
+For the grid target the printed geometry lives in `gridtarget.py` (`CELL_MM`,
+`MARKER_MM`, `LINE_MM`, `BOARDS`) and `artprojector.py` imports it, so the PDF
+and the detector cannot drift apart. Change any of it and you have to reprint
+*and* recalibrate. `GRID_ANCHOR_X_MM`/`GRID_ANCHOR_Y_MM` in `artprojector.py`
+are the equivalent of `RIGHT_MARGIN_MM`/`BOTTOM_MARGIN_MM`: they stay zero when
+the board is taped flush to the canvas edges, and are where a millimetre of
+mounting error goes if it is not.
+
 ## Hardware notes
 
 - Through OpenCV/AVFoundation the GXI-IMX179 reliably streams only 1920x1080
@@ -383,14 +590,21 @@ See the "GEOMETRY CONFIG" block in `artprojector.py`:
 ## Files
 
 - `artprojector.py` - the main tool (calibrate / run / overlay / gen-template / list).
+- `gridtarget.py` - the 1-inch ArUco grid: its geometry (imported by
+  `artprojector.py`) and the PDF generator. `--check` reads the tiles back
+  through the detector to prove the board is fully covered.
+- `templates/` - the generated grids, plus a `README.md` on printing and gluing
+  them. Regenerate with `python gridtarget.py`.
 - `capture.py` - grab one frame to a file (for debugging).
 - `make_refs.py` - posterized reference variations.
 - `synthtest.py` - accuracy check on synthetic frames with a known homography;
-  `--legacy` runs the pre-SVG square model against the real geometry.
+  `--legacy` runs the pre-SVG square model against the real geometry,
+  `--target grid` runs the ArUco board rendered from its actual PDF.
 - `calibr.svg` - the calibration target to print (100%, A4 artwork).
 - `calibr-1216.png` - the target drawn over a 12x16" canvas, by hand.
 - `calibr-1216-exact.png` - the same from `gen-template`, exact.
 - `calibration.npz` - written by `calibrate`: the homography `H` (mm -> undistorted
-  image px), the lens distortion `k1`/`k2`, the canvas size it was made for, and
-  `model_sig`, the sheet geometry it was fitted to - change the geometry and
-  `run`/`overlay` will tell you the file is stale instead of quietly drifting.
+  image px), the lens distortion `k1`/`k2`, the canvas size it was made for,
+  which `target` (and `board`) it was fitted to, and `model_sig`, the target
+  geometry itself - change the geometry and `run`/`overlay` will tell you the
+  file is stale instead of quietly drifting.

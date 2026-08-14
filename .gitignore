@@ -16,3 +16,6 @@ ref/
 *.jpeg
 !calibr-1216.png
 !calibr-1216-exact.png
+
+# IDE
+.idea/
