@@ -81,6 +81,12 @@ Two ways to make it true:
   --grid-anchor-y 0` explicitly once the board is flush. They are part of the
   model, so changing them makes the old calibration stale - `calibrate` again.
 
+  The board's *thickness* is the third measurement of the same kind, and it
+  matters for the same reason: glued to card, the printed grid sits a
+  millimetre or two above the canvas, which a camera at this angle sees as a
+  millimetre or two sideways. See [The thickness of the
+  target](#calibrate) - `--thickness`, or `[` / `]` in `calibrate`.
+
 **Checking it.** Use `gen-template` output as the overlay reference, not a PDF
 converted to an image:
 
@@ -261,7 +267,8 @@ printed target; `--board` implies `--target grid` and also sets the canvas size,
 since the board is canvas-sized), `--canvas-w-in 12 --canvas-h-in 16`
 (canvas size), `--adjust FILE.npz` (where overlay saves/loads its adjustment),
 `--view-max 2000` (render size of the corrected overlay view),
-`--fit consensus|corners` (how the homography is fitted), `--k1/--k2` (starting
+`--fit consensus|corners` (how the homography is fitted), `--thickness 1.5`
+(how thick the printed target is, in mm - see below), `--k1/--k2` (starting
 lens distortion for `calibrate`; normally just press `a` there instead),
 `--ppm 4` (resolution of the `gen-template` output), `--fullscreen`,
 `--display N|NAME`, `--no-keep-awake`.
@@ -300,6 +307,17 @@ mechanism but needs logind and a desktop that honours it, while the poke works
 through the screensaver but not against a scheduled suspend. Everything is
 best-effort - a line saying which ones came up is printed at startup, and a
 machine that cannot be kept awake still runs. `--no-keep-awake` turns it off.
+
+The inhibitor is let go however the program ends. A clean exit, a Ctrl-C, a
+`SIGTERM` or a closed terminal go through an atexit hook and signal handlers,
+which kill the whole process group - the inhibitor holds a child of its own,
+and killing only the parent leaves that child running. Underneath both sits a
+dead man's switch for the cases nobody gets told about (`kill -9`, a segfault
+in a camera driver): the command the inhibitor holds is a `cat` reading a pipe
+whose other end is ours, so the kernel closing our file descriptors is itself
+the release. Anything an older version still left behind is swept up at the
+next startup - an inhibitor of ours whose parent is no longer an artprojector
+belongs to nobody, and is reported as `released N inhibitor(s)`.
 
 The camera must not move between `calibrate` and `run`/`overlay`.
 
@@ -396,6 +414,43 @@ automatically (both the raw and the corrected view). In a synthetic test with
 `k1=-0.12` the correction cut the resulting canvas-corner error from ~13 px to
 ~0.5 px.
 
+**The thickness of the target** (`[` / `]`, `--thickness`). The target is
+printed on something - paper on cardboard, a mounted print, foam board - so the
+ink lies a millimetre or two *above* the canvas, and everything in this window
+measures the ink. A camera looking straight down would not care: two parallel
+planes differ only in depth, and depth is what a top-down view collapses. This
+camera looks from the side on purpose, so that it is not between the painter
+and the canvas, and at that angle the point of ink and the point of canvas
+underneath it are two different pixels. The gap is `thickness x tan(angle from
+the normal)`: on a 50° view, every millimetre of card is a millimetre of error,
+and at 70° it is nearly three.
+
+Set it with `[` and `]` (0.2 mm a press) or `--thickness 1.5`, and watch the
+yellow outline: it is where the same coordinates land on the canvas *under* the
+target, next to the cyan fit on the ink. The HUD says what the correction is
+worth in millimetres in the middle of the frame. Default is 0 - the ink taken
+to lie flat on the canvas.
+
+This is the second number, with the mounting offset above, that nothing in the
+frame can check for you: the snap residual is measured against the ink, and the
+ink is exactly where the fit says it is, so every diagnostic here reads
+beautifully while the overlay lands a millimetre off in the same direction
+everywhere. Measure the card with calipers, or measure the miss on the canvas
+and dial the value until it goes away.
+
+It is stored *beside* the fit in `calibration.npz` rather than folded into it,
+so `--thickness 1.6` on any later `run`/`overlay` re-measures the cardboard
+without recalibrating, and the saved `H` stays what the camera actually saw.
+Internally the correction turns `H` back into a camera pose - `H = K[x y o]`
+for the plane it was fitted to, so the parallel plane `dz` further away is
+`K[x y o + dz*n]` - and hands the result on as an ordinary 3x3 homography;
+nothing downstream learns that a pose was involved. The weak link is that
+`camera_matrix()` pins the focal length to `max(w, h)` instead of measuring it,
+and the focal length is what sets the estimated tilt, so read the correction as
+very nearly right rather than exact. It is exactly linear in the thickness,
+which is why the number has hotkeys: tuning it by eye absorbs whatever the
+focal length gets wrong.
+
 ### run
 
 Loads `calibration.npz` and shows the rectified canvas plane in real time.
@@ -405,8 +460,8 @@ Loads `calibration.npz` and shows the rectified canvas plane in real time.
 
 Draws a reference over the live frame, projected into the canvas perspective.
 The reference is stretched to the whole canvas, so only the part inside the
-camera view is shown. Three render modes: contours (Canny edges), the original
-image, and multiply - all blended with adjustable opacity. An optional third
+camera view is shown. Four render modes: contours (Canny edges), the original
+image, multiply, and overlay - all blended with adjustable opacity. An optional third
 layer shows what changed since a snapshot (the brush, fresh paint) at full
 opacity on top.
 
@@ -419,7 +474,8 @@ Controls:
 | `[` / `]` | stretch X down / up |
 | `-` / `=` | stretch Y down / up |
 | `,` / `.` | rotate |
-| `m` | cycle contours / image / multiply |
+| `m` | cycle contours / image / multiply / overlay |
+| `I` | invert the reference (the overlaid image, not the camera) |
 | `9` / `0` | opacity down / up |
 | `1` `2` / `3` `4` | Canny low / high thresholds |
 | `n` | snapshot the canvas + delta layer on (see below) |
@@ -437,6 +493,22 @@ interpolation, so it only ever darkens: white areas of the reference leave the
 camera image untouched and whatever is already drawn on the real canvas stays
 visible through the dark ones. That is what you want for checking work against
 a reference, where plain image mode would wash the canvas out.
+
+**Overlay mode** is multiply's answer to a dark canvas. Multiply only darkens,
+so once there is dark paint under it a black reference line disappears into it -
+which is exactly where the drawing is still needed. Overlay keeps the
+reference's *coverage* (how black the ref pixel is) but takes the ink's
+lightness from the canvas underneath: white ink over dark paint, black ink over
+light paper, decided per pixel at gray 118. So the line reads at the same
+strength everywhere, and white areas of the reference still leave the frame
+untouched, as in multiply. It is not Photoshop's "overlay" blend, which fades
+the ink out over mid greys - and mid greys are most of a painting; the
+lightness is chosen with a hard threshold instead.
+
+**`I` inverts the reference itself** - the overlaid image, never the camera
+frame. A negative (white lines on black) becomes usable ink for multiply and
+overlay, and it is the quickest way to read a value study the other way round.
+Contours mode does not change: Canny sees the same edges either way.
 
 **Delta layer (experimental).** Normally there are two layers: the live camera
 frame and the reference blended over it. `n` adds a third. It snapshots the
@@ -464,6 +536,7 @@ excluded (measured on a 24-thread CPU, OpenCV 4.10):
 | contours | 11 |
 | image | 9 |
 | multiply | 10 |
+| overlay | 20 |
 | + delta layer | +5 |
 
 Everything is plain CPU OpenCV, and deliberately so. There is no CUDA in a
@@ -604,7 +677,9 @@ mounting error goes if it is not.
 - `calibr-1216.png` - the target drawn over a 12x16" canvas, by hand.
 - `calibr-1216-exact.png` - the same from `gen-template`, exact.
 - `calibration.npz` - written by `calibrate`: the homography `H` (mm -> undistorted
-  image px), the lens distortion `k1`/`k2`, the canvas size it was made for,
+  image px, on the plane of the ink), the lens distortion `k1`/`k2`, the
+  `thickness` of the printed target (applied to `H` on load, which is what puts
+  it on the canvas), the canvas size it was made for,
   which `target` (and `board`) it was fitted to, and `model_sig`, the target
   geometry itself - change the geometry and `run`/`overlay` will tell you the
   file is stale instead of quietly drifting.

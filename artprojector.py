@@ -41,7 +41,8 @@ Usage:
 
 While a session runs, sleep and the screensaver are held off two ways at once
 (a systemd-inhibit/caffeinate child, plus a poke every 45 s) - a suspend would
-re-enumerate the camera, and the camera must not move.
+re-enumerate the camera, and the camera must not move. The child is let go on
+the way out, whatever the way out is, down to a kill -9.
 
 In the calibrate window:
   col_off / row_off trackbars - shift the visible block over the 3x2 grid
@@ -51,6 +52,9 @@ In the calibrate window:
   f  - switch the homography fit: consensus quad <-> individual corners
   e  - toggle the sub-pixel snap of the fit onto the printed lines
   r  - let the snap retune k1/k2 as well
+  [ ]- the thickness of what the target is printed on, 0.2 mm a press: the
+       ink sits that far above the canvas, and seen from the side that is
+       millimetres of error (--thickness, and see TARGET THICKNESS below)
   c  - compute and save the homography (+ the distortion)
   q / ESC - quit
 
@@ -61,10 +65,12 @@ In the run window:
 """
 
 import argparse
+import atexit
 import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -151,9 +157,69 @@ BOTTOM_MARGIN_MM = 145.0           # canvas bottom edge -> bottom line of the BO
 #
 #  Everything is best-effort and silent: a machine that cannot be kept awake
 #  is not a reason to refuse to run.
+#
+#  Letting go of the inhibitor is fiddlier than taking it, because it is a
+#  child process and the ways out of this program are many: a clean return, a
+#  Ctrl-C, a SIGTERM, a closed terminal (SIGHUP), a segfault in a camera
+#  driver, a kill -9. Three things cover them, in order of how gracefully they
+#  fire: an atexit hook and signal handlers for the exits we get told about; a
+#  process group kill, because the inhibitor holds a child of its own and
+#  killing only the parent orphans it; and, underneath both, a dead man's
+#  switch - the held command is `cat` reading a pipe we own the other end of,
+#  so the kernel closing our file descriptors on death is itself the release.
+#  A sweep at startup collects anything an older run still managed to leave.
 # ==========================================================================
 KEEP_AWAKE = True
 _POKE_PERIOD_S = 45.0
+
+
+def _proc_text(pid, name):
+    try:
+        with open(f"/proc/{pid}/{name}", "rb") as f:
+            return f.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _ppid(pid):
+    m = re.search(r"^PPid:\s*(\d+)", _proc_text(pid, "status"), re.M)
+    return int(m.group(1)) if m else 0
+
+
+def _reap_orphan_inhibitors():
+    """Kill inhibitors left behind by a run that died without cleaning up.
+
+    An inhibitor of ours whose parent is no longer an artprojector is by
+    definition nobody's: the session that took it is gone and the lock it
+    holds would sit there until the next reboot. A parent that is still an
+    artprojector means a second session is running - leave that one alone.
+    """
+    if platform.system() != "Linux":
+        return 0
+    stale = []
+    for pid in os.listdir("/proc") if os.path.isdir("/proc") else []:
+        if not pid.isdigit():
+            continue
+        cmd = _proc_text(pid, "cmdline")
+        if "systemd-inhibit" not in cmd or "--who=artprojector" not in cmd:
+            continue
+        if "artprojector" in _proc_text(_ppid(pid), "cmdline"):
+            continue
+        stale.append(int(pid))
+    if not stale:
+        return 0
+    # the held command (`cat`, or a `sleep infinity` from an older version) is
+    # a child of the inhibitor and outlives it, so it has to go too
+    victims = set(stale)
+    for pid in os.listdir("/proc"):
+        if pid.isdigit() and _ppid(pid) in victims:
+            victims.add(int(pid))
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    return len(stale)
 
 
 class KeepAwake:
@@ -165,15 +231,19 @@ class KeepAwake:
         self._stop = threading.Event()
         self._thread = None
         self._poke = None          # the poke command that worked, if any
+        self._prev_signals = {}
 
     # -- mechanism 1: a held inhibitor ------------------------------------
     def _inhibitor_cmd(self):
         if platform.system() == "Darwin":
             # -dimsu: display, idle, disk, system; -w dies with us
             return ["caffeinate", "-dimsu", "-w", str(os.getpid())]
+        # `cat` and not `sleep infinity`: its stdin is a pipe whose write end
+        # only we hold, so however this process ends - Ctrl-C, SIGHUP, kill -9,
+        # a crash - the kernel closes it, cat reads EOF and the inhibitor exits
         return ["systemd-inhibit", "--what=idle:sleep:handle-lid-switch",
                 "--who=artprojector", f"--why={self.why}", "--mode=block",
-                "sleep", "infinity"]
+                "cat"]
 
     # -- mechanism 2: periodic "somebody is still here" -------------------
     def _poke_cmds(self):
@@ -204,11 +274,19 @@ class KeepAwake:
                 break
 
     def start(self):
+        orphans = _reap_orphan_inhibitors()
+        if orphans:
+            print(f"[awake] released {orphans} inhibitor(s) left by an "
+                  f"earlier run")
         cmd = self._inhibitor_cmd()
         if shutil.which(cmd[0]):
             try:
-                self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                              stderr=subprocess.DEVNULL)
+                # its own session, so that stop() can kill the whole group and
+                # not just the parent, leaving the held command running
+                self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                              stdout=subprocess.DEVNULL,
+                                              stderr=subprocess.DEVNULL,
+                                              start_new_session=True)
             except Exception:
                 self._proc = None
         for c in self._poke_cmds():
@@ -223,17 +301,72 @@ class KeepAwake:
                             (f"poke ({self._poke[0]})" if self._poke else "poke",
                              self._poke is not None)) if ok)
         print(f"[awake] {held or 'nothing worked - the machine may still sleep'}")
+        atexit.register(self.stop)
+        self._catch_signals()
         return self
 
-    def stop(self):
-        self._stop.set()
-        if self._proc is not None:
+    # -- letting go -------------------------------------------------------
+    def _catch_signals(self):
+        """Release on the signals that would otherwise skip every cleanup.
+
+        SIGINT is left alone: Python turns it into a KeyboardInterrupt, which
+        unwinds through the caller's finally. These do not - the default is to
+        die on the spot - so we release, put the old handler back and let the
+        signal happen for real, exit status and all.
+        """
+        def handler(signum, frame):
+            prev = self._prev_signals.get(signum, signal.SIG_DFL)
+            self.stop()
+            signal.signal(signum, prev)
+            os.kill(os.getpid(), signum)
+
+        for name in ("SIGTERM", "SIGHUP"):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
             try:
-                self._proc.terminate()
-                self._proc.wait(timeout=3)
+                self._prev_signals[sig] = signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+
+    def _restore_signals(self):
+        for sig, prev in list(self._prev_signals.items()):
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, OSError):
+                pass
+        self._prev_signals.clear()
+
+    def stop(self):
+        """Idempotent: called from the caller's finally, atexit and signals."""
+        self._stop.set()
+        self._restore_signals()
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:                                   # the dead man's switch, pulled
+            if proc.stdin is not None:         # by hand: EOF ends `cat`, which
+                proc.stdin.close()             # ends the inhibitor
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+            return
+        except Exception:
+            pass
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:                               # the group: the inhibitor's own
+                os.killpg(proc.pid, sig)       # child would outlive it
+            except Exception:
+                try:
+                    proc.send_signal(sig)
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=2)
+                return
             except Exception:
                 pass
-            self._proc = None
 
     def __enter__(self):
         return self.start()
@@ -707,14 +840,20 @@ def grid_view_span(matches):
     return len(matches), max(cs) - min(cs) + 1, max(rs) - min(rs) + 1, float(np.hypot(w, h))
 
 
-def draw_grid_overlay(vis, H, cell_model, matches, pad=1):
+def draw_grid_overlay(vis, H, cell_model, matches, pad=1, H_canvas=None):
     """Draw the fitted grid over the frame, plus the canvas outline.
 
     Only the cells around the ones that were recognised are drawn. Projecting
     the whole 320-cell board through a homography fitted to a 50 mm patch sends
     the far cells to coordinates that overflow an int32 and takes cv2.polylines
     with them; and a grid drawn where nothing was measured would be claiming
-    an accuracy this frame cannot support anyway."""
+    an accuracy this frame cannot support anyway.
+
+    H_canvas, when given, is the same fit moved down onto the canvas by the
+    target's thickness: it draws in yellow next to the cyan, so the parallax
+    the number is correcting is on screen instead of taken on faith. The canvas
+    outline then comes from it too - the outline is a canvas edge, not an ink
+    one."""
     if H is None or not matches:
         return
     cs = [c for (c, _, _) in matches]
@@ -723,10 +862,13 @@ def draw_grid_overlay(vis, H, cell_model, matches, pad=1):
            if min(cs) - pad <= k[0] <= max(cs) + pad
            and min(rs) - pad <= k[1] <= max(rs) + pad}
     draw_model(vis, H, sub, REFINE_COLOR, 1)
+    if H_canvas is not None:
+        draw_model(vis, H_canvas, sub, THICKNESS_COLOR, 1)
     # the canvas outline, if it lands anywhere sane
     box = np.array([[-CANVAS_W, -CANVAS_H], [0.0, -CANVAS_H],
                     [0.0, 0.0], [-CANVAS_W, 0.0]], np.float64)
-    p = np.hstack([box, np.ones((4, 1))]) @ np.asarray(H, np.float64).T
+    p = np.hstack([box, np.ones((4, 1))]) @ np.asarray(
+        H if H_canvas is None else H_canvas, np.float64).T
     if np.all(np.abs(p[:, 2]) > 1e-9):
         p = p[:, :2] / p[:, 2:3]
         if np.all(np.abs(p) < 1e5):
@@ -1850,7 +1992,7 @@ def draw_metric_grid(img, step_mm=50.0):
 
 
 def calibrate(cap, model):
-    global FIT_MODE, DIST_K1, DIST_K2
+    global FIT_MODE, DIST_K1, DIST_K2, TARGET_THICKNESS_MM
     win = "calibrate"
     make_window(win)
     cv2.createTrackbar("col_off", win, 0, max(0, COLS - 1), lambda v: None)
@@ -1871,7 +2013,9 @@ def calibrate(cap, model):
           "        5/6 change the step, 0 resets the distortion,\n"
           "        'e' toggles the sub-pixel refinement, 'r' lets it retune\n"
           "        k1/k2 as well, 'f' switches consensus/per-corner fit,\n"
+          "        '['/']' set the thickness of what the target is printed on,\n"
           "        'c' saves.")
+    print(thickness_intro())
 
     while True:
         raw = read_frame(cap)
@@ -1925,6 +2069,11 @@ def calibrate(cap, model):
                 # undistorted with it, so the loop settles after a few frames
                 k1, k2 = nk1, nk2
                 draw_model(vis, H_live, model, REFINE_COLOR)
+                # and, a card's thickness below the ink, the canvas itself
+                if TARGET_THICKNESS_MM:
+                    draw_model(vis, canvas_homography(H_live, frame.shape[1],
+                                                      frame.shape[0]),
+                               model, THICKNESS_COLOR)
             else:
                 H_live = None
 
@@ -1942,10 +2091,14 @@ def calibrate(cap, model):
                 if rinfo["ok"] else ("snap: no lock" if do_refine else "snap: off"))
         hud = [txt,
                f"k1={k1:+.4f} k2={k2:+.4f} step={kstep:.4f}   "
-               f"line residual={res:.3f} px   fit={FIT_MODE}",
+               f"line residual={res:.3f} px   fit={FIT_MODE}   "
+               + thickness_hud(H_live,
+                               canvas_homography(H_live, frame.shape[1],
+                                                 frame.shape[0]),
+                               frame.shape[1], frame.shape[0]),
                snap,
                "1/2 k1  3/4 k2  5/6 step  a auto-fit dist  0 reset dist  "
-               "e refine  r +k1k2  v report  f fit  c save  q quit"]
+               "[ ] thickness  e refine  r +k1k2  v report  f fit  c save  q quit"]
         y = 30
         for ln in hud:
             cv2.putText(vis, ln, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
@@ -1974,6 +2127,8 @@ def calibrate(cap, model):
             kstep = min(1.0, kstep * 2.0)
         elif key == ord('0'):
             k1 = k2 = 0.0
+        elif thickness_key(key):
+            pass
         elif key == ord('e'):
             do_refine = not do_refine
         elif key == ord('r'):
@@ -2028,12 +2183,15 @@ def calibrate(cap, model):
                      canvas_w=CANVAS_W, canvas_h=CANVAS_H,
                      k1=k1, k2=k2, model_sig=model_signature(),
                      cam_w=frame.shape[1], cam_h=frame.shape[0],
-                     target="squares")
+                     target="squares", thickness=TARGET_THICKNESS_MM)
             DIST_K1, DIST_K2 = k1, k2
-            H_saved = H
+            # what goes in the file is the fit, to the ink; what comes back out
+            # of here is what everything downstream means by the canvas
+            H_saved = canvas_homography(H, frame.shape[1], frame.shape[0])
             print(f"[calib] homography saved to {CALIB_FILE} "
                   f"(fit={FIT_MODE}, from {len(matches)} squares, "
                   f"k1={k1:+.4f} k2={k2:+.4f})")
+            print(thickness_save_note(H, H_saved, frame.shape[1], frame.shape[0]))
             print(f"[calib] line residual: {collinearity_residual(matches):.3f} px")
             # Quick confirmation. Both errors are measured over all detected
             # corners, so per-corner is expected to win here almost by
@@ -2075,7 +2233,7 @@ def calibrate_grid(cap):
     overlay only ever draws over the part of the canvas that IS in the frame.
     A number to trust for its own sake wants a frame with cells spread across
     it, not two cells in the middle."""
-    global DIST_K1, DIST_K2
+    global DIST_K1, DIST_K2, TARGET_THICKNESS_MM
     cell_model = build_grid_cell_model()
     marker_model = build_grid_marker_model()
     cols, rows, base = gt.board_spec(GRID_BOARD)
@@ -2116,7 +2274,9 @@ def calibrate_grid(cap):
           "        and 'snap' is how far it still misses, in mm on the paper.\n"
           "        'a' auto-fits the lens distortion, 1/2 3/4 tune k1/k2 by\n"
           "        hand, 5/6 change the step, 0 resets it, 'e' toggles the\n"
-          "        snap, 'r' lets it retune k1/k2, 'v' reports, 'c' saves.")
+          "        snap, 'r' lets it retune k1/k2, '['/']' set the thickness\n"
+          "        of the board it is printed on, 'v' reports, 'c' saves.")
+    print(thickness_intro())
 
     while True:
         raw = read_frame(cap)
@@ -2152,7 +2312,9 @@ def calibrate_grid(cap):
             cen = np.round(quad.mean(axis=0)).astype(int)
             cv2.putText(vis, f"{col},{row}", tuple(cen), cv2.FONT_HERSHEY_SIMPLEX,
                         0.7, (0, 220, 0), 2, cv2.LINE_AA)
-        draw_grid_overlay(vis, H_show, cell_model, matches)
+        H_canvas = canvas_homography(H_show, frame.shape[1], frame.shape[0])
+        draw_grid_overlay(vis, H_show, cell_model, matches,
+                          H_canvas=H_canvas if TARGET_THICKNESS_MM else None)
 
         n, nc, nr, span = grid_view_span(matches)
         reach = np.hypot(CANVAS_W, CANVAS_H) / max(span, 1e-6)
@@ -2164,7 +2326,8 @@ def calibrate_grid(cap):
                f"{'' if H_mark is not None else '  [no marker - no fit]'}",
                f"k1={k1:+.4f} k2={k2:+.4f} step={kstep:.4f}   board={GRID_BOARD}"
                f"   board corner at ({GRID_ANCHOR_X_MM:+.0f},{GRID_ANCHOR_Y_MM:+.0f})mm"
-               f" from the canvas corner",
+               f" from the canvas corner   "
+               f"{thickness_hud(H_show, H_canvas, frame.shape[1], frame.shape[0])}",
                (f"snap={rinfo['rms_mm']:.3f} mm ({rinfo['rms_px']:.2f} px) on "
                 f"{rinfo['n']}/{rinfo['n_total']} pts  "
                 f"ink={2 * rinfo['ink_mm']:.2f}mm"
@@ -2172,7 +2335,7 @@ def calibrate_grid(cap):
                 if rinfo["ok"] else
                 ("snap: no lock" if do_refine else "snap: off")),
                "1/2 k1  3/4 k2  5/6 step  a auto-fit dist  0 reset dist  "
-               "e refine  r +k1k2  v report  c save  q quit"]
+               "[ ] thickness  e refine  r +k1k2  v report  c save  q quit"]
         y = 30
         for ln in hud:
             cv2.putText(vis, ln, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
@@ -2199,6 +2362,8 @@ def calibrate_grid(cap):
             kstep = min(1.0, kstep * 2.0)
         elif key == ord('0'):
             k1 = k2 = 0.0
+        elif thickness_key(key):
+            pass
         elif key == ord('e'):
             do_refine = not do_refine
         elif key == ord('r'):
@@ -2252,13 +2417,17 @@ def calibrate_grid(cap):
                      k1=k1, k2=k2, model_sig=model_signature(),
                      cam_w=frame.shape[1], cam_h=frame.shape[0],
                      target="grid", board=GRID_BOARD,
-                     grid_anchor=np.array([GRID_ANCHOR_X_MM, GRID_ANCHOR_Y_MM]))
+                     grid_anchor=np.array([GRID_ANCHOR_X_MM, GRID_ANCHOR_Y_MM]),
+                     thickness=TARGET_THICKNESS_MM)
             DIST_K1, DIST_K2 = k1, k2
-            H_saved = H
+            # the file keeps the fit as measured, on the ink; the caller gets
+            # the canvas plane a board's thickness below it
+            H_saved = canvas_homography(H, frame.shape[1], frame.shape[0])
             n, nc, nr, span = grid_view_span(matches)
             print(f"[calib] homography saved to {CALIB_FILE} "
                   f"(grid {GRID_BOARD}, {n} markers over {nc}x{nr} cells, "
                   f"span {span:.0f} mm, k1={k1:+.4f} k2={k2:+.4f})")
+            print(thickness_save_note(H, H_saved, frame.shape[1], frame.shape[0]))
             print(f"[calib] marker reprojection error: "
                   f"{reprojection_error(matches, marker_model, H):.2f} px")
             if span < 0.35 * np.hypot(CANVAS_W, CANVAS_H):
@@ -2384,6 +2553,238 @@ def reprojection_error(matches, model, H):
 
 
 # ==========================================================================
+#  TARGET THICKNESS - THE PARALLAX BETWEEN THE INK AND THE CANVAS
+#
+#  The target is printed on something. Paper on cardboard, a mounted print,
+#  foam board - whatever it is, the ink lies a millimetre or two ABOVE the
+#  canvas, and everything here measures the ink. A camera looking straight down
+#  would not care: two parallel planes differ only in depth, and depth is what
+#  a top-down view collapses. This camera does not look straight down - it sits
+#  off to the side on purpose, so that it is not between the painter and the
+#  canvas. At that angle the point of ink and the point of canvas underneath it
+#  are two different pixels, and the gap is thickness * tan(angle from the
+#  normal): 1.5 mm of cardboard seen at 45 degrees is 1.5 mm of error, in one
+#  direction, over the whole canvas.
+#
+#  It is worth being clear about what kind of error that is. It is not noise
+#  and it does not average out; it is a bias that a perfect calibration cannot
+#  see, because the snap residual is measured against the ink and the ink is
+#  exactly where the fit says it is. Every diagnostic in the calibrate window
+#  reads beautifully while the overlay lands a millimetre off, in the same
+#  place, every time - the same failure mode as a stale mounting offset
+#  (GRID_ANCHOR_*), and like that one it can only be fixed by measuring the
+#  thing and saying so.
+#
+#  The correction needs to know where the camera is, and a homography plus an
+#  assumed intrinsic gives that up: H = K[x y o] for the plane it was fitted
+#  to, where x and y are its axes and o its origin in camera millimetres, so
+#  the parallel plane dz further away is K[x y o + dz*n]. One column moved
+#  along the plane normal, nothing else touched. Everything downstream keeps
+#  taking a plain 3x3 mm -> px homography and never learns that a pose was
+#  involved.
+#
+#  The weak link is the focal length: camera_matrix() pins f to max(w,h)
+#  instead of measuring it, and f is what sets the estimated tilt. So read the
+#  correction as "very nearly right" rather than exact - it is what makes a
+#  1.5 mm card 1.8 mm of error instead of 2.1, not what makes it 1.8 instead
+#  of zero. It is also exactly linear in the thickness, which is the saving
+#  grace: dialling the number by eye against the overlay absorbs whatever f
+#  gets wrong, and that is why the value has hotkeys and not just a flag.
+# ==========================================================================
+TARGET_THICKNESS_MM = 0.0          # how far the ink sits above the canvas
+THICKNESS_STEP_MM = 0.2            # [ and ] in the calibrate windows
+THICKNESS_EXPLICIT = False         # --thickness given; do not adopt the file's
+THICKNESS_FROM_FILE = False        # inherited from the last calibration
+THICKNESS_COLOR = (0, 255, 255)    # BGR yellow - the canvas plane under the ink
+
+
+def plane_pose(H, cam_w, cam_h):
+    """(x_axis, y_axis, origin, normal) of H's plane, in camera millimetres.
+
+    The first three are K^-1 H's columns, scaled so that the two axes are unit
+    on average - which is what turns the homography's arbitrary scale into
+    millimetres, since the axes ARE unit in the world.
+
+    They are deliberately NOT squared up into a rotation matrix. The textbook
+    move is to take the nearest orthonormal frame by SVD, and it is wrong here:
+    K is a guess (camera_matrix pins f to max(w,h)), so the columns come out
+    genuinely non-orthonormal, and the nearest rotation is a different plane
+    from the one that was fitted - by hundreds of pixels on a steep view. Kept
+    as they are, K[x y origin] reproduces H exactly, and the correction below
+    is then a pure offset from it: zero thickness changes nothing, and a
+    thickness moves things along the plane normal and nowhere else.
+
+    The normal is the one thing the cross product gives correctly whatever the
+    columns' lengths and angle: any two independent vectors in a plane span it,
+    so their cross product is perpendicular to it."""
+    if H is None or cam_w <= 0 or cam_h <= 0:
+        return None
+    A = np.linalg.inv(camera_matrix(cam_w, cam_h)) @ np.asarray(H, np.float64)
+    if A[2, 2] < 0:
+        A = -A                     # the plane is in front of the camera, not behind
+    n1, n2 = np.linalg.norm(A[:, 0]), np.linalg.norm(A[:, 1])
+    if not np.isfinite(A).all() or min(n1, n2) < 1e-12:
+        return None
+    lam = 2.0 / (n1 + n2)
+    x, y, o = lam * A[:, 0], lam * A[:, 1], lam * A[:, 2]
+    n = np.cross(x, y)
+    ln = np.linalg.norm(n)
+    if ln < 1e-12:
+        return None
+    return x, y, o, n / ln
+
+
+def offset_homography(H, cam_w, cam_h, dz_mm):
+    """H for the plane dz_mm BEHIND H's own - further from the camera."""
+    if H is None or abs(dz_mm) < 1e-9:
+        return H
+    pose = plane_pose(H, cam_w, cam_h)
+    if pose is None:
+        return H
+    x, y, o, n = pose
+    # which way the normal points depends on how the model happens to be laid
+    # out, and "behind" has to mean away from the camera either way. o runs
+    # from the camera to the plane's origin, so its sign against the normal
+    # settles it.
+    away = 1.0 if float(n @ o) >= 0 else -1.0
+    Ho = camera_matrix(cam_w, cam_h) @ np.column_stack(
+        [x, y, o + away * dz_mm * n])
+    if not np.isfinite(Ho).all() or abs(Ho[2, 2]) < 1e-12:
+        return H
+    return Ho / Ho[2, 2]           # the same normalisation findHomography uses
+
+
+def canvas_homography(H, cam_w=0, cam_h=0):
+    """H moved off the ink and onto the canvas, per TARGET_THICKNESS_MM.
+
+    This is where a saved calibration becomes the thing the rest of the tool
+    wants: the file stores H as it was fitted, to the ink, together with the
+    thickness as a separate number, and the two are combined on the way out.
+    Storing the corrected H instead would bake a hand-measured constant into
+    the one value that was actually measured from the image, and re-measuring
+    the cardboard would mean recalibrating - so `--thickness 1.6` on any run
+    is enough, and the fit stays what the camera saw."""
+    if not TARGET_THICKNESS_MM or H is None:
+        return H
+    w = cam_w or CALIB_CAM_W
+    h = cam_h or CALIB_CAM_H
+    if not w or not h:
+        print("[calib] target thickness ignored: the calibration does not say "
+              "which capture size H was fitted at, and the correction needs it "
+              "to place the camera. Recalibrate.")
+        return H
+    return offset_homography(H, w, h, TARGET_THICKNESS_MM)
+
+
+def thickness_shift_mm(H, H_canvas, pts_mm):
+    """How far the correction moves things, in mm on the canvas.
+
+    For each point: aim at it with the uncorrected H and see where on the
+    canvas that ray actually lands. Millimetres of bias, in the units the user
+    cares about, rather than a pixel count or an angle."""
+    pts = np.asarray(pts_mm, np.float64).reshape(-1, 1, 2)
+    if H is None or H_canvas is None:
+        return np.zeros(len(pts))
+    try:
+        px = cv2.perspectiveTransform(pts, np.asarray(H, np.float64))
+        land = cv2.perspectiveTransform(px, np.linalg.inv(
+            np.asarray(H_canvas, np.float64)))
+    except (cv2.error, np.linalg.LinAlgError):
+        return np.zeros(len(pts))
+    return np.linalg.norm(land - pts, axis=2).reshape(-1)
+
+
+def view_centre_mm(H, cam_w=0, cam_h=0):
+    """World mm under the middle of the frame - where the camera is looking.
+
+    The right place to report millimetres at. The correction grows with the
+    tangent of the angle between the viewing ray and the plane, so it has no
+    single value over the canvas: quoting it at the canvas centre would quote
+    it where the camera may not even be pointed, and on a grazing view that
+    point can sit beyond the horizon of H, where every number is meaningless
+    long before the thickness gets involved. The middle of the frame is inside
+    what was measured, by construction."""
+    w = cam_w or CALIB_CAM_W
+    h = cam_h or CALIB_CAM_H
+    if H is None or not w or not h:
+        return None
+    try:
+        p = cv2.perspectiveTransform(
+            np.array([[[w / 2.0, h / 2.0]]], np.float64),
+            np.linalg.inv(np.asarray(H, np.float64)))
+    except (cv2.error, np.linalg.LinAlgError):
+        return None
+    return None if not np.isfinite(p).all() else tuple(p.reshape(2))
+
+
+def thickness_hud(H=None, H_canvas=None, cam_w=0, cam_h=0):
+    """The HUD fragment for the current thickness, and what it is worth."""
+    txt = f"thick={TARGET_THICKNESS_MM:.2f}mm"
+    if not TARGET_THICKNESS_MM or H is None or H_canvas is None:
+        return txt
+    at = view_centre_mm(H, cam_w, cam_h)
+    if at is None:
+        return txt
+    return f"{txt} ({thickness_shift_mm(H, H_canvas, [at])[0]:.2f}mm mid-frame)"
+
+
+def thickness_save_note(H, H_canvas, cam_w=0, cam_h=0):
+    """What was just written about the thickness, and what it costs in mm."""
+    if not TARGET_THICKNESS_MM:
+        return ("[calib] target thickness saved as 0 - the ink taken to lie "
+                "flat on the canvas. If it does not, that is an error you keep, "
+                "and no residual in this window can show it to you.")
+    at = view_centre_mm(H, cam_w, cam_h)
+    d = "" if at is None else (
+        f", which moves the mapping by "
+        f"{thickness_shift_mm(H, H_canvas, [at])[0]:.2f} mm in the middle of "
+        f"this frame")
+    return (f"[calib] target thickness {TARGET_THICKNESS_MM:.2f} mm saved "
+            f"beside the fit; the canvas plane is taken to sit that far behind "
+            f"the ink{d}. The correction grows with the tangent of the viewing "
+            f"angle, so it is larger than this wherever the view is more "
+            f"grazing than it is here.")
+
+
+def thickness_key(key):
+    """'[' / ']' in the calibrate windows. True if the key was one of them.
+
+    Clamped at zero: the ink can be above the canvas or on it, never inside
+    it, and a negative value here would only ever be a slip of the finger."""
+    global TARGET_THICKNESS_MM
+    if key == ord('['):
+        TARGET_THICKNESS_MM = max(
+            0.0, round(TARGET_THICKNESS_MM - THICKNESS_STEP_MM, 3))
+    elif key == ord(']'):
+        TARGET_THICKNESS_MM = round(TARGET_THICKNESS_MM + THICKNESS_STEP_MM, 3)
+    else:
+        return False
+    print(f"[calib] target thickness {TARGET_THICKNESS_MM:.2f} mm "
+          f"(the ink is that far above the canvas)")
+    return True
+
+
+def thickness_intro():
+    """What the calibrate windows say about the thickness on the way in."""
+    if not TARGET_THICKNESS_MM:
+        return ("[calib] the target is taken to be INFINITELY THIN - the ink "
+                "lying exactly on the canvas. If it is printed on card or "
+                "mounted on board,\n"
+                "        measure that thickness and set it with '[' / ']' (0.2 "
+                "mm a press) or --thickness: seen from the side, a millimetre "
+                "of it is a\n"
+                "        millimetre of error everywhere, and nothing in this "
+                "window can see it.")
+    inherited = (" (inherited from the last calibration - re-measure it if the "
+                 "target has been reprinted or remounted)"
+                 if THICKNESS_FROM_FILE else "")
+    return (f"[calib] the ink is taken to sit {TARGET_THICKNESS_MM:.2f} mm above "
+            f"the canvas{inherited}. The yellow outline is where those\n"
+            f"        same coordinates land on the canvas underneath; '[' / ']' "
+            f"change it by {THICKNESS_STEP_MM} mm.")
+
+
+# ==========================================================================
 #  RUN MODE - live rectification
 # ==========================================================================
 CALIB_CAM_W = 0                    # capture size H was fitted at (0 = unknown)
@@ -2412,8 +2813,14 @@ def load_calibration():
     The file also says which TARGET it was made with, and that is adopted
     unless --target said otherwise - a calibration and the target it was fitted
     to are one object, and making the user repeat the flag on every run just
-    invites the two to be paired up wrong."""
+    invites the two to be paired up wrong.
+
+    The H in the file is the one that was fitted, i.e. the INK plane; the H
+    returned is the canvas plane, TARGET_THICKNESS_MM behind it (see
+    canvas_homography). Every caller wants the canvas, so the correction
+    happens here, once."""
     global DIST_K1, DIST_K2, CALIB_CAM_W, CALIB_CAM_H, _SIG_WARNED
+    global TARGET_THICKNESS_MM, THICKNESS_FROM_FILE
     try:
         data = np.load(CALIB_FILE)
     except FileNotFoundError:
@@ -2429,6 +2836,10 @@ def load_calibration():
     if not GRID_ANCHOR_EXPLICIT and "grid_anchor" in data:
         GRID_ANCHOR_X_MM, GRID_ANCHOR_Y_MM = (float(v) for v in data["grid_anchor"])
         GRID_ANCHOR_FROM_FILE = bool(GRID_ANCHOR_X_MM or GRID_ANCHOR_Y_MM)
+    # the thickness travels with the calibration too, for the same reason
+    if not THICKNESS_EXPLICIT and "thickness" in data:
+        TARGET_THICKNESS_MM = float(data["thickness"])
+        THICKNESS_FROM_FILE = bool(TARGET_THICKNESS_MM)
     DIST_K1 = float(data["k1"]) if "k1" in data else 0.0
     DIST_K2 = float(data["k2"]) if "k2" in data else 0.0
     CALIB_CAM_W = int(data["cam_w"]) if "cam_w" in data else 0
@@ -2443,7 +2854,17 @@ def load_calibration():
             print(f"[calib] WARNING: {CALIB_FILE} was made with a different "
                   f"target geometry than the one configured now - recalibrate, "
                   f"or the reference will land a millimetre or two out.")
-    return data["H"]
+    H = np.asarray(data["H"], np.float64)
+    Hc = canvas_homography(H)
+    if TARGET_THICKNESS_MM and Hc is not H:
+        at = view_centre_mm(H)
+        d = "" if at is None else (f" - {thickness_shift_mm(H, Hc, [at])[0]:.2f} "
+                                   f"mm where the camera was pointed")
+        print(f"[calib] target thickness {TARGET_THICKNESS_MM:.2f} mm"
+              f"{' (from the calibration file)' if THICKNESS_FROM_FILE else ''}"
+              f": the fit is moved off the ink and onto the canvas underneath"
+              f"{d}. --thickness changes it, --thickness 0 switches it off.")
+    return Hc
 
 
 def scale_homography(H, from_wh, to_wh):
@@ -2519,7 +2940,7 @@ def run(cap, model):
 OVERLAY_ADJUST_FILE = "overlay_adjust.npz"
 OVERLAY_COLORS = [(0, 255, 0), (0, 0, 255), (255, 255, 0),
                   (255, 0, 255), (0, 255, 255), (255, 255, 255)]
-RENDER_MODES = ["contours", "image", "multiply"]
+RENDER_MODES = ["contours", "image", "multiply", "overlay"]
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
 # Arrow keys, as reported by cv2.waitKeyEx on the various HighGUI backends
@@ -2566,6 +2987,42 @@ def draw_ref_dots(img, idx, total, margin=16, r=7, gap=22):
         cv2.circle(img, (x, y), r, (0, 255, 255) if i == idx else (80, 80, 80),
                    -1, cv2.LINE_AA)
         x -= gap
+
+
+AUTO_INK_SPLIT = 118      # camera gray below this counts as "dark canvas"
+
+
+def draw_auto_ink(base, ref, split=AUTO_INK_SPLIT):
+    """The reference laid down as ink that flips to stay readable.
+
+    multiply darkens and only darkens, so a black line over a black
+    under-painting is invisible - exactly where the drawing is most needed.
+    Here the ink keeps the reference's *coverage* (how dark the ref pixel is)
+    but takes its colour from the canvas underneath: white where the camera
+    sees dark paint, black where it sees light paper. Photoshop's "overlay"
+    blend is the same idea (base decides, blend layer modulates) but it fades
+    the ink out over mid greys, and mid greys are most of a painting - so the
+    lightness is picked with a hard threshold instead.
+
+    base/ref are BGR uint8 of the same size; the ref is expected to be white
+    (= no ink) wherever it should not touch the frame, which is what the white
+    warp border gives. Returns a new BGR image; the caller still blends it in
+    with the global alpha.
+    """
+    # keep = how much of the base survives = the reference's own lightness;
+    # ink = 255 - keep is its coverage
+    keep = cv2.cvtColor(cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY),
+                        cv2.COLOR_GRAY2BGR)
+    out = cv2.multiply(base, keep, scale=1.0 / 255.0)    # black ink: multiply
+    gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+    _, on_dark = cv2.threshold(gray, split, 255, cv2.THRESH_BINARY_INV)
+    # White ink is the screen blend, 255 - (255-base)*keep/255, which expands
+    # to exactly (black-ink result + ink) - so the light branch falls out of
+    # the multiply already done, as one saturating add. Adding it under the
+    # mask does the per-pixel choice in the same pass: no second full-frame
+    # image to build and no copyTo (12.5 -> 10.6 ms at 1545x2000).
+    cv2.add(out, cv2.bitwise_not(keep), dst=out, mask=on_dark)
+    return out
 
 
 def _resize_max(img, max_side):
@@ -2726,6 +3183,17 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
     canny_lo, canny_hi, blur = 50, 150, 3
     # shrunk color copy of the current reference (for image mode and contours)
     ref_small, epts, elens, rh, rw, ref_i = None, None, None, 0, 0, 0
+    # negative of ref_small, built on first use and dropped on every load_ref
+    ref_neg, ref_invert = None, False
+
+    def ref_layer():
+        """The reference as it should be drawn, honouring the 'I' inversion."""
+        nonlocal ref_neg
+        if not ref_invert:
+            return ref_small
+        if ref_neg is None:
+            ref_neg = cv2.bitwise_not(ref_small)
+        return ref_neg
 
     def rebuild_edges():
         nonlocal epts, elens
@@ -2739,13 +3207,14 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
         Only ref_small/edges change, so the alignment, opacity, Canny
         thresholds, render mode and viewport all carry over to the next image -
         which is the point of stepping through a folder."""
-        nonlocal ref_small, rh, rw, ref_i
+        nonlocal ref_small, ref_neg, rh, rw, ref_i
         img = cv2.imread(refs[i])
         if img is None:
             print(f"[overlay] could not read the reference: {refs[i]}")
             return False
         ref_i = i
         ref_small = _resize_max(img, 1600)
+        ref_neg = None                 # rebuilt on demand for the new reference
         rh, rw = ref_small.shape[:2]
         rebuild_edges()
         print(f"[overlay] reference {i + 1}/{len(refs)}: {refs[i]}")
@@ -2854,7 +3323,8 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
 
     cv2.setMouseCallback(win, on_mouse)
     print("[overlay] w/a/s/d move, z/x scale, [ ] X, - = Y, ,/. rotate,\n"
-          "          m contours/image/multiply, 9/0 opacity -/+,\n"
+          "          m contours/image/multiply/overlay, 9/0 opacity -/+,\n"
+          "          I invert the reference (the overlaid image, not the camera),\n"
           "          LEFT/RIGHT arrows = previous/next reference in the folder,\n"
           "          1/2 3/4 Canny, o toggle, c color, r raw/corrected,\n"
           "          n snapshot (of the empty canvas) + delta layer on,\n"
@@ -2955,27 +3425,33 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
                 draw_polylines_blended(disp, epts, elens, M,
                                        OVERLAY_COLORS[color_i], alpha)
             else:
-                # Both modes blend only where the reference actually lands, and
-                # both get that for free from the warp border instead of from a
+                # The image modes blend only where the reference actually
+                # lands, and they get that for free from the warp border
+                # instead of from a
                 # coverage mask - a mask would mean a second warp plus a
                 # boolean-indexed float32 gather over the whole frame, which
                 # measures ~80 ms against ~3.5 ms for the two calls below.
-                if render_mode == "multiply":
+                if render_mode in ("multiply", "overlay"):
                     # multiply only ever darkens, so the reference reads as ink
                     # laid over the canvas: white paper in the ref leaves the
                     # camera image untouched and what is drawn on the real
                     # canvas stays visible through the dark areas. A white
                     # border extends that no-op to everything outside the ref.
-                    over = cv2.warpPerspective(
-                        ref_small, M, (cw, ch), flags=cv2.INTER_LINEAR,
+                    # "overlay" wants the same white border for the same reason
+                    # - white is zero ink there too.
+                    warped = cv2.warpPerspective(
+                        ref_layer(), M, (cw, ch), flags=cv2.INTER_LINEAR,
                         borderMode=cv2.BORDER_CONSTANT,
                         borderValue=(255, 255, 255))
-                    over = cv2.multiply(over, disp, scale=1.0 / 255.0)
+                    if render_mode == "multiply":
+                        over = cv2.multiply(warped, disp, scale=1.0 / 255.0)
+                    else:
+                        over = draw_auto_ink(disp, warped)
                 else:
                     # BORDER_TRANSPARENT leaves dst alone where the ref does not
                     # reach, so those pixels end up blending disp with disp
                     over = disp.copy()
-                    cv2.warpPerspective(ref_small, M, (cw, ch), dst=over,
+                    cv2.warpPerspective(ref_layer(), M, (cw, ch), dst=over,
                                         flags=cv2.INTER_LINEAR,
                                         borderMode=cv2.BORDER_TRANSPARENT)
                 disp = cv2.addWeighted(disp, 1.0 - alpha, over, alpha, 0.0)
@@ -2993,10 +3469,15 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
         if show_help:
             hud = [f"ref {ref_i + 1}/{len(refs)}: {os.path.basename(refs[ref_i])}",
                    f"dx={dx:+.0f}mm dy={dy:+.0f}mm  sx={sx:.3f} sy={sy:.3f}  rot={theta:+.1f}deg",
-                   f"mode={render_mode}  alpha={alpha:.2f}  zoom={view['z']:.1f}x  "
+                   f"mode={render_mode}{' INV' if ref_invert else ''}  "
+                   f"alpha={alpha:.2f}  zoom={view['z']:.1f}x  "
                    f"Canny={canny_lo}/{canny_hi}  overlay={'on' if show else 'off'}  "
                    f"view={'corrected' if rectified else 'raw (perspective)'}"
-                   f"{'' if (DIST_K1 or DIST_K2) else ' no-undistort'}  "
+                   f"{'' if (DIST_K1 or DIST_K2) else ' no-undistort'}"
+                   # not adjustable here - H is already folded into the warp -
+                   # but it is the number to suspect if everything lands the
+                   # same small distance out in the same direction
+                   f"{f'  thick={TARGET_THICKNESS_MM:.2f}mm' if TARGET_THICKNESS_MM else ''}  "
                    f"render={cw}x{ch}"
                    + (f" {view['z'] / A[0, 0]:.1f}px/mm" if rectified else ""),
                    f"delta={'on' if use_delta else ('armed' if delta_on else 'off')}"
@@ -3006,7 +3487,7 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
                    + ("" if (fw, fh) == (calib_w, calib_h) else " (scaled H)")
                    + f"  {fps:.1f} fps",
                    "w/a/s/d move  z/x scale  [ ] X  - = Y  ,/. rot  i RESET adj  "
-                   "p save adj  m mode  9/0 alpha  1/2 3/4 canny  5/6 delta thr  "
+                   "p save adj  m mode  I invert ref  9/0 alpha  1/2 3/4 canny  5/6 delta thr  "
                    "n snap  t delta  v cam res  <-/-> ref"]
             y0 = 26
             for ln in hud:
@@ -3075,6 +3556,13 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
             show_help = not show_help
         elif k == ord('i'):
             dx, dy, sx, sy, theta = 0.0, 0.0, 1.0, 1.0, 0.0
+        elif k == ord('I'):
+            # SHIFT+i, because plain 'i' has meant "reset the adjustment" since
+            # before this existed and that is not a keystroke to make ambiguous
+            ref_invert = not ref_invert
+            print(f"[overlay] reference {'inverted' if ref_invert else 'normal'}"
+                  + ("  (contours are unchanged - Canny sees the same edges)"
+                     if render_mode == "contours" else ""))
         elif k == ord('p'):
             np.savez(adjust_path, dx=dx, dy=dy, sx=sx, sy=sy, theta=theta, alpha=alpha)
             print(f"[overlay] adjustment saved to {adjust_path}")
@@ -3226,6 +3714,7 @@ def main():
     global PX_PER_MM, CANVAS_W, CANVAS_H, REQ_WIDTH, REQ_HEIGHT, DISPLAY_MAX
     global FIT_MODE, DIST_K1, DIST_K2, FULLSCREEN, DISPLAY_TARGET, KEEP_AWAKE
     global TARGET_EXPLICIT, GRID_ANCHOR_X_MM, GRID_ANCHOR_Y_MM, GRID_ANCHOR_EXPLICIT
+    global TARGET_THICKNESS_MM, THICKNESS_EXPLICIT
     ap = argparse.ArgumentParser(description="Canvas perspective calibration/rectification")
     ap.add_argument("mode", choices=["calibrate", "run", "overlay", "gen-template",
                                      "grid-probe", "list"])
@@ -3258,6 +3747,14 @@ def main():
                     help="the same for the canvas BOTTOM edge and the board's "
                          "bottom border. Both change the model, so recalibrate "
                          "after setting them.")
+    ap.add_argument("--thickness", type=float, default=None,
+                    help="thickness in mm of what the target is printed on "
+                         "(card, board): the ink sits that far above the "
+                         "canvas, and a camera looking from the side turns "
+                         "every millimetre of it into a millimetre of error. "
+                         "Default 0; '[' / ']' tune it in calibrate. Stored "
+                         "beside the fit rather than inside it, so it can be "
+                         "changed on any run without recalibrating.")
     ap.add_argument("--board", default=None,
                     help=f"which printed grid ({', '.join(gt.BOARDS)}); implies "
                          f"--target grid. The board is canvas-sized, so it also "
@@ -3317,6 +3814,9 @@ def main():
         GRID_ANCHOR_X_MM, GRID_ANCHOR_EXPLICIT = args.grid_anchor_x, True
     if args.grid_anchor_y is not None:
         GRID_ANCHOR_Y_MM, GRID_ANCHOR_EXPLICIT = args.grid_anchor_y, True
+    if args.thickness is not None:
+        TARGET_THICKNESS_MM = max(0.0, args.thickness)
+        THICKNESS_EXPLICIT = True
     # The saved calibration names its own target, and it has to be read before
     # anything asks build_model() - a model built for the wrong target would
     # only announce itself as a signature mismatch, several steps too late.
