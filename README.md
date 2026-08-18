@@ -10,6 +10,13 @@ computes a homography between the image and the canvas plane (in millimeters),
 which is enough to rectify what the camera sees and to project a reference onto
 it.
 
+There is a second half, for an easel with a real projector aimed at it:
+[`projcalib.py`](#projector-calibration---projcalibpy) measures where the
+projector's pixels land on the canvas - using the calibrated camera as the
+instrument - and [`project.py`](#projecting-a-reference---projectpy) throws a
+reference onto the canvas, pre-distorted so that it lands square on it whatever
+angle the projector sits at.
+
 There are two printed targets, chosen with `--target`:
 
 | | `--target squares` (default) | `--target grid` |
@@ -611,6 +618,191 @@ the block size but shifted 0.65 mm up - and those errors are the same size as
 the ones being hunted. `calibr-1216-exact.png` is the generated equivalent at
 the same 1152x1536.
 
+## Projector calibration - projcalib.py
+
+The camera calibration says where the canvas is in the camera frame. A
+projector aimed at the same canvas needs the other half of the answer: which
+projector pixel lands on which millimetre of the canvas. `projcalib.py` measures
+it, using the already-calibrated camera as the instrument:
+
+```
+python artprojector.py list                        # which monitor is the projector
+python projcalib.py --cam 0 --display 1 --board 12x16
+```
+
+Two windows open: the pattern goes fullscreen on `--display`, and the camera
+view goes to the first monitor that is *not* the projector - `--cam-display`
+(index or name) overrides that, and with a single screen both land on it and the
+camera window has to be moved by hand.
+
+It fills the projector with a lattice of squares - the same idea as the printed
+target, made of light and measured in projector pixels - with an ArUco marker
+centred in every cell. The camera reads whichever markers fall in its frame,
+each one says which cell it is, and the chain
+
+```
+projector px --H_pc--> camera px --H_cam^-1--> canvas mm
+```
+
+is fitted and composed. What gets saved (`projector.npz`) is that composition
+and its inverse, `mm -> projector px`, which is what a reference image has to be
+warped through to land on the canvas.
+
+The projected markers are `DICT_5X5_1000` while the printed board is
+`DICT_4X4_1000`, so the printed target can stay on the canvas while this runs -
+and it is worth leaving there, because then the verification views show the
+projected geometry landing on printed lines whose position is known
+independently.
+
+### How fine the lattice should be
+
+`--cells` (default 16 across the projector frame), `--cell-px` in projector
+pixels, or `n`/`m` while it runs; the report says what a cell comes to in
+millimetres on the canvas and roughly how many cells fall on it.
+
+The instinct on seeing the pattern is that the squares are far too big, and it
+is usually right, but not for the reason it feels like. Big markers decode from
+further away and refine their corners better - the trouble is that a camera
+framed on part of the canvas then holds two or three of them, and a homography
+fitted to four corners in one corner of the frame extrapolates badly across
+everything else. On a synthetic close-up view (the camera on about a third of
+the canvas, the projector covering half again more than the canvas), 8 cells
+gave 2 markers and 0.45 px of error at the far corner of the canvas; 16 gave 10
+markers and 0.19 px; 24 gave 24 markers and 0.08 px.
+
+The other end of the trade is real too, and synthetic frames cannot show it: a
+projected marker is softened by the projector's focus, by the canvas texture and
+by the camera, so past some fineness the modules stop being resolved and the
+marker is simply not read. Below 56 px per cell the lattice is clamped for that
+reason. Between the two, go as fine as still decodes reliably in *your* room -
+the marker count in the HUD is the thing to watch while pressing `m`.
+
+### What it reports
+
+Pressing `c` measures (several frames averaged, RANSAC over the markers) and
+prints the things that decide whether the projector is aimed well enough:
+
+- the residual **in millimetres on the canvas**, not in camera pixels - a
+  homography has no term for a bowed canvas or for the projector's own lens
+  distortion, and both land here;
+- how much of the projector frame the camera actually saw the markers over -
+  everything outside that is extrapolated;
+- where the projected frame lands in canvas millimetres, what share of the
+  canvas it covers, and what share of the light falls past it;
+- the clearance from each canvas edge to the edge of the projection, in mm, and
+  a loud line when the projection does not reach the canvas at all;
+- projector pixels per mm on the canvas (i.e. the dpi actually available for
+  painting), the keystone across the canvas, and the rotation of the projector's
+  image relative to the canvas axes.
+
+### Checking it by eye
+
+`r` projects a white rectangle exactly the size of the canvas, `g` a test grid
+drawn in canvas millimetres, `v` a canvas-sized image (`--verify-image`, by
+default `calibr-1216-exact.png`). All three are authored in millimetres and
+pushed through the fit, so they close the loop without the camera: the lit
+rectangle either sits on the canvas or it does not, and a centimetre of error is
+obvious across the room. ENTER saves.
+
+An existing `projector.npz` is loaded at startup, so all of that works
+immediately and a session that only wants to check the alignment - or to nudge
+it - never has to measure again. Re-measuring (`c`) is for when the projector or
+the canvas has moved.
+
+### When the rectangle misses the canvas: the hand adjustment
+
+`a`/`d`/`w`/`s` move the projection 2 mm, `z`/`x` scale it about the canvas
+centre, `[`/`]` and `-`/`=` scale one axis, `,`/`.` rotate, `i` zeroes it - the
+keys, the steps and the meaning are overlay's, because it is the same gesture on
+the same canvas. It is saved into `projector.npz` (in `H_mm_to_proj`, with the
+raw fit and the adjustment kept beside it), and announced on every load: a
+measured mapping and a hand-tuned one must never become indistinguishable.
+
+`TAB` cycles five states: the whole projection, then each of the four corners.
+In a corner state `a`/`d`/`w`/`s` move that corner alone, and a big arrow -
+drawn on the canvas itself, not just in the camera window - points at the one
+being moved, because the person nudging it is looking across the room at the
+canvas.
+
+The corners are not a convenience, they are the other half of the freedom. Move,
+scale and rotate together are a similarity, and a similarity cannot bend a
+rectangle: if the projection is short at one corner and long at the opposite
+one, nothing in it can help. The four corners add exactly the four degrees of
+freedom that make the adjustment a full homography, which is where a residual
+keystone, a canvas that is not quite rectangular, or a bowed corner can be taken
+out. Drag a corner across its neighbours and there is no homography at all; that
+falls back to no correction rather than to a matrix full of infinities.
+
+Before reaching for it, note **what shape the error is**, because it names the
+cause. An error that is zero at the right and bottom edges and grows towards the
+left and top is not an offset - those two edges are the origin of the world
+frame - it is a **scale**. If the rectangle stops 0.5" short on the left of a
+12" canvas and 5/8" short at the top of a 16" one, that is ~4% in both axes, and
+there are only two things it can be:
+
+- **the canvas is not the size the model thinks.** Nothing in the frame marks
+  the canvas edge, so the model takes it from the board (`--board 12x16`). Give
+  it the real size with `--canvas-w-in/--canvas-h-in` and the projection lands
+  where it should, with the calibration untouched.
+- **the printed board is not the size it says**, i.e. it was printed at ~96%.
+  Then the millimetre itself is 4% short - *everywhere*, `overlay` included -
+  and this is simply the first view honest enough to show it.
+
+`g` tells them apart in one measurement: put a ruler on the projected 50 mm
+grid. Squares that are not 50 mm mean the millimetre is wrong, and the fix
+belongs at the printer, not here. Squares that are 50 mm while the border misses
+the canvas edge mean the canvas is a different size than declared. The hand
+adjustment papers over either one, but only for the projector.
+
+Two things the fit cannot notice on its own. The camera must not have moved
+since `artprojector.py calibrate` - a nudged camera gives a perfectly
+self-consistent fit that is simply in the wrong place. And once saved, the
+mapping is between the projector and the canvas alone: it survives the camera
+being moved or unplugged, and goes stale the moment the projector or the canvas
+moves.
+
+If the projector is set to mirror its image (rear projection, some ceiling
+mounts), nothing is detected at all rather than detected wrong - a mirrored
+ArUco marker is not a codeword. Turn the flip off in the projector's menu.
+
+## Projecting a reference - project.py
+
+```
+python project.py --ref ref/nadya-1/4/bw --display 1
+python project.py --ref check.png --display 1 --fit contain --invert
+```
+
+The other end of the calibration: a picture is placed on the canvas in
+millimetres, pushed backwards through `mm -> projector px`, and what the
+projector displays is a keystoned, rotated, oversized shape nobody would
+recognise - which lands on the canvas as the picture, square to its edges and
+the right size, whatever angle the projector sits at.
+
+Nothing is projected outside the canvas rectangle: the frame, the easel and the
+wall stay dark. That is politer to look at and it is also a standing check - the
+lit area *is* the canvas, so if it creeps off the edge, something has moved.
+
+`--ref` takes a file or a folder, and a folder steps with LEFT/RIGHT, as in
+`overlay`; the masks and contour sheets from `make_refs.py` are what this is for.
+`I` inverts (white lines on black - far easier to trace by, and it lights the
+canvas far less), `9`/`0` dim and brighten, `f` switches stretch-to-canvas for
+keep-aspect, `b` outlines the canvas, `k` blacks out.
+
+The placement keys are overlay's again (`a/d/w/s`, `z/x`, `[ ]`, `- =`, `,/.`,
+`i`, and `p` to save), and this adjustment goes to its own file,
+`project_adjust.npz`. Three adjustments now exist and they are deliberately
+separate files, because they answer different questions: `overlay_adjust.npz`
+places a reference in the *camera* view, `project_adjust.npz` places it in the
+*projection*, and the one inside `projector.npz` corrects the projector-canvas
+mapping itself. If the lit rectangle no longer matches the canvas edges, that
+last one (or the calibration) is what is wrong; if it matches and the drawing
+sits badly inside it, it is this one.
+
+Two windows open, as in `projcalib.py`: the picture goes fullscreen on
+`--display`, the readout to a small control window on another monitor
+(`--ctl-display`) - a HUD painted onto the canvas would be a HUD painted onto
+the painting.
+
 ## Posterized reference variations - make_refs.py
 
 Builds per-tone black-and-white stencils and contour drawings from an image, for
@@ -663,6 +855,13 @@ mounting error goes if it is not.
 ## Files
 
 - `artprojector.py` - the main tool (calibrate / run / overlay / gen-template / list).
+- `projcalib.py` - projector calibration: fills the projector with an ArUco
+  lattice, reads it through the calibrated camera and writes `projector.npz`
+  (`mm -> projector px`, the hand adjustment included, with the raw fit and the
+  adjustment kept beside it).
+- `project.py` - projects a reference onto the canvas through that mapping,
+  pre-distorted so it lands square on the canvas; `project_adjust.npz` is where
+  its placement is saved.
 - `gridtarget.py` - the 1-inch ArUco grid: its geometry (imported by
   `artprojector.py`) and the PDF generator. `--check` reads the tiles back
   through the detector to prove the board is fully covered.
@@ -683,3 +882,12 @@ mounting error goes if it is not.
   which `target` (and `board`) it was fitted to, and `model_sig`, the target
   geometry itself - change the geometry and `run`/`overlay` will tell you the
   file is stale instead of quietly drifting.
+- `projector.npz` - written by `projcalib.py`: `H_mm_to_proj` (the one to use,
+  hand adjustment included) and its inverse, `H_mm_to_proj_raw` and
+  `adjust`/`corner_adjust` (what was measured and what was tuned by hand, kept
+  apart on purpose), the projector frame size the pixels refer to, the canvas
+  size, and the residual and marker count of the fit.
+- `overlay_adjust.npz`, `project_adjust.npz` - where a reference sits, in the
+  camera view and in the projection respectively. Three adjustments exist in
+  total and they are three files because they answer three different questions;
+  see the `project.py` section.
