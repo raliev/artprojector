@@ -619,7 +619,7 @@ GRID_SEARCH_MM = 1.5
 GRID_COARSE_MM = 3.0
 
 
-def use_grid_target(board=None):
+def use_grid_target(board=None, rev=None):
     """Switch the whole tool over to the ArUco grid.
 
     The refinement reads STROKE_MM / REFINE_SEARCH_MM / REFINE_COARSE_MM as
@@ -631,10 +631,154 @@ def use_grid_target(board=None):
     if board:
         gt.board_spec(board)                     # raises on an unknown name
         GRID_BOARD = board
+    if rev is not None:
+        gt.set_id_rev(rev)
     STROKE_MM = gt.LINE_MM
     REFINE_SEARCH_MM = GRID_SEARCH_MM
     REFINE_COARSE_MM = GRID_COARSE_MM
     REFINE_USE_COARSE = False                    # see REFINE_USE_COARSE
+
+
+# ==========================================================================
+#  WHICH TEMPLATE REVISION THE SHEET IS
+#
+#  Rev 1 numbered the cells row-major from the board's top-left out of a range
+#  reserved for that board; rev 2 numbers them from the bottom-right corner off
+#  a shared lattice, which is what lets one printed sheet serve several canvas
+#  sizes (see gridtarget). The two are the same paper, the same cells, the same
+#  lines - only the id in each cell differs, so nothing but the decode changes.
+#
+#  Which means it can be worked out by looking. Read the same frame both ways
+#  and count the ids that land on the configured board: the right revision
+#  accounts for all of them, the wrong one for about a third (the fraction of
+#  ids the two schemes happen to share), and the rest come out foreign. So the
+#  default is to look, once, at the first frame with enough markers in it, and
+#  then stop asking - the answer is a property of the ink on the wall, and it
+#  does not change while the program runs.
+#
+#  Two markers in view can be ambiguous: each has roughly a one-in-three chance
+#  of being valid under the wrong scheme too, so a two-cell close-up can tie. A
+#  tie resolves nothing and is left unresolved rather than guessed at, which
+#  costs a frame; the next slightly wider view settles it. --board-rev 1 or 2
+#  skips all of it.
+# ==========================================================================
+BOARD_REV_AUTO = True              # work it out from the ids (--board-rev auto)
+BOARD_REV_RESOLVED = False         # ...and whether that has happened yet
+BOARD_REV_EXPLICIT = False         # --board-rev 1|2 given; do not adopt the file's
+
+
+def set_board_rev(rev):
+    """--board-rev: 'auto', or a revision number to take as given."""
+    global BOARD_REV_AUTO, BOARD_REV_RESOLVED
+    if str(rev).strip().lower() == "auto":
+        # 'auto' means unknown until a frame says otherwise, and the safe
+        # placeholder is the current revision - not whatever was pinned before,
+        # which would both misreport itself and refuse the sizes rev 1 lacks.
+        gt.set_id_rev(gt.TEMPLATE_REV)
+        BOARD_REV_AUTO, BOARD_REV_RESOLVED = True, False
+        return None
+    gt.set_id_rev(int(rev))
+    BOARD_REV_AUTO, BOARD_REV_RESOLVED = False, True
+    return gt.ID_REV
+
+
+def require_valid_board_rev():
+    """Refuse a board/revision pair that never existed on paper, up front.
+
+    Rev 1 was only ever printed in two sizes, and asking for any other one is a
+    mistake worth catching here rather than as a puzzling ValueError from the
+    middle of the detector."""
+    if TARGET != "grid" or gt.ID_REV != 1:
+        return
+    if GRID_BOARD not in gt.legacy_boards():
+        raise SystemExit(
+            f"[grid] --board {GRID_BOARD} --board-rev 1: there was never a "
+            f"rev 1 board of that size.\n"
+            f"       Rev 1 exists as {', '.join(gt.legacy_boards())} only. "
+            f"Either name one of those, or print a\n"
+            f"       rev {gt.TEMPLATE_REV} sheet for {GRID_BOARD} "
+            f"(python gridtarget.py --boards {GRID_BOARD}) and drop "
+            f"--board-rev.")
+
+
+def resolve_board_rev(ids, cols, rows, announce=True):
+    """Pick the revision the decoded `ids` fit, and remember it. Idempotent.
+
+    Returns the revision in force. Does nothing once resolved, or when the
+    revisions cannot be told apart on this evidence."""
+    global BOARD_REV_RESOLVED
+    if BOARD_REV_RESOLVED or not BOARD_REV_AUTO or len(ids) == 0:
+        return gt.ID_REV
+    votes = {}
+    for rev in (gt.TEMPLATE_REV, 1):
+        try:
+            votes[rev] = sum(1 for m in ids
+                             if gt.cell_of_id(int(m), cols, rows, rev=rev))
+        except ValueError:
+            continue                 # no board of this size at that revision
+    if len(votes) < 2:
+        BOARD_REV_RESOLVED = True    # nothing to choose between
+        return gt.ID_REV
+    (best, n_best), (other, n_other) = sorted(votes.items(),
+                                              key=lambda kv: -kv[1])
+    # A clear win, not a coin toss: the wrong scheme explains about a third of
+    # the ids, so anything short of twice as many is not evidence.
+    if n_best < 2 or n_best < 2 * n_other:
+        return gt.ID_REV
+    gt.set_id_rev(best)
+    BOARD_REV_RESOLVED = True
+    # Only the surprising answer is worth a line. Confirming the current
+    # revision is the normal case and says nothing; grid-probe prints the vote
+    # either way, for when it is the question being asked.
+    if announce and best != gt.TEMPLATE_REV:
+        print(f"[grid] these are template rev {best} ids "
+              f"({n_best} of {len(ids)} decode onto a {cols}x{rows} board at "
+              f"rev {best}, {n_other} at rev {other}) - reading the sheet as "
+              f"rev {best}. Pass --board-rev {best} to say so outright.")
+    return gt.ID_REV
+
+
+def grid_intro():
+    """What `calibrate` says about the grid before the window opens."""
+    cols, rows = gt.board_spec(GRID_BOARD)
+    # The full-size sheets that contain this board - what one is likely to have
+    # actually printed. Every size in between works the same way, so listing
+    # them all would be noise. Empty at rev 1, where nothing is interchangeable.
+    bigger = [b for b in gt.minimal_boards()
+              if b in gt.boards_covering(GRID_BOARD) and b != GRID_BOARD]
+    # and of those, the one to name in the example: the smallest, and among
+    # equals the one the same way up as this board
+    pick = min(bigger, key=lambda b: (gt.BOARDS[b][0] * gt.BOARDS[b][1],
+                                      (gt.BOARDS[b][0] >= gt.BOARDS[b][1])
+                                      != (cols >= rows))) if bigger else None
+    return (
+        f"[calib] {GRID_BOARD} grid: {cols}x{rows} cells of {gt.CELL_MM:.1f} mm, "
+        f"{cols * rows} markers"
+        + (f", template rev {gt.ID_REV}.\n"
+           f"        Rev 1 ids: the original sheet, and only its own size - the "
+           f"one-sheet-\n"
+           f"        serves-several-sizes trick came with rev {gt.TEMPLATE_REV} "
+           f"and needs one of those.\n" if gt.ID_REV == 1 else
+           ".\n" if not BOARD_REV_AUTO or BOARD_REV_RESOLVED else
+           " (revision from the ids, once they are seen).\n")
+        + (f"        A printed {' or '.join(bigger)} sheet serves just as well "
+           f"here, as long as\n"
+           f"        it is mounted flush with the bottom-right canvas corner: "
+           f"the cells over\n"
+           f"        this {GRID_BOARD} area are this board, and the ones "
+           f"beyond it are counted\n"
+           f"        as foreign, which is not an error. Name the sheet instead "
+           f"of the canvas\n"
+           f"        (--board {pick} --canvas-w-in {cols} --canvas-h-in "
+           f"{rows}) to use those too.\n" if bigger else "")
+        + "        Aim anywhere on the board - two or three cells are enough.\n"
+          "        Green outlines are recognised markers, labelled with the\n"
+          "        cell they are; cyan is the fitted grid snapped onto the ink,\n"
+          "        and 'snap' is how far it still misses, in mm on the paper.\n"
+          "        'a' auto-fits the lens distortion, 1/2 3/4 tune k1/k2 by\n"
+          "        hand, 5/6 change the step, 0 resets it, 'e' toggles the\n"
+          "        snap, 'r' lets it retune k1/k2, '['/']' set the thickness\n"
+          "        of the board it is printed on, 'v' reports, 'c' saves.")
 
 
 def grid_origin_mm():
@@ -643,7 +787,7 @@ def grid_origin_mm():
     Board-local coordinates run right and DOWN from that corner (gridtarget's
     frame); the world runs right and down from the canvas's top-left too, only
     with its zero at the bottom-right corner. So the two differ by a shift."""
-    cols, rows, _ = gt.board_spec(GRID_BOARD)
+    cols, rows = gt.board_spec(GRID_BOARD)
     return (GRID_ANCHOR_X_MM - cols * gt.CELL_MM,
             GRID_ANCHOR_Y_MM - rows * gt.CELL_MM)
 
@@ -663,7 +807,7 @@ def build_grid_cell_model():
     twice, once from each side - which is harmless and mildly useful: the two
     measurements approach it from opposite directions and their biases, if
     any, cancel."""
-    cols, rows, _ = gt.board_spec(GRID_BOARD)
+    cols, rows = gt.board_spec(GRID_BOARD)
     ox, oy = grid_origin_mm()
     return {(c, r): _rect_quad(gt.cell_rect_mm(c, r), ox, oy)
             for r in range(rows) for c in range(cols)}
@@ -674,7 +818,7 @@ def build_grid_marker_model():
 
     Same order as cv2.aruco.detectMarkers() returns them for a marker printed
     the right way up: top-left first, then clockwise."""
-    cols, rows, _ = gt.board_spec(GRID_BOARD)
+    cols, rows = gt.board_spec(GRID_BOARD)
     ox, oy = grid_origin_mm()
     return {(c, r): _rect_quad(gt.marker_rect_mm(c, r), ox, oy)
             for r in range(rows) for c in range(cols)}
@@ -743,8 +887,13 @@ def detect_grid_cells(frame, k1=0.0, k2=0.0):
     of its own that anything measured.
 
     n_foreign counts markers that decoded cleanly but are not on the configured
-    board - the disjoint id ranges doing their job, and usually a sign that
-    --board names the wrong sheet.
+    board. Two innocent reasons and one guilty one. The sheet on the wall is
+    bigger than the board named: legitimate, and expected - the ids are shared
+    only over the rectangle the two sizes have in common (see gridtarget), so
+    the cells beyond it land here. A misread invented a plausible id: also
+    expected, and this is one of the two things that catch it. Or --board names
+    a size the sheet does not contain at all, which is the guilty one - then
+    nearly everything is foreign and nothing fits.
 
     n_clipped counts markers dropped for touching the edge of the frame. They
     have to go: the contour of a marker the sensor cut off is closed along the
@@ -752,13 +901,17 @@ def detect_grid_cells(frame, k1=0.0, k2=0.0):
     whole pixels - 20 px on a 208 px marker, measured - while the marker still
     decodes perfectly and looks like any other. The margin scales with the
     marker because that inward drag does too."""
-    cols, rows, base = gt.board_spec(GRID_BOARD)
+    cols, rows = gt.board_spec(GRID_BOARD)
     gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape[:2]
     corners, ids, _ = aruco_detector().detectMarkers(gray)
     matches, foreign, clipped = [], 0, 0
     if ids is None:
         return matches, foreign, clipped
+    # Before any id is turned into a cell: which revision printed them. Every
+    # mode decodes here, so this is the one place that has to ask, and it only
+    # asks until it knows.
+    resolve_board_rev(ids.reshape(-1), cols, rows)
     for quad, mid in zip(corners, ids.reshape(-1)):
         q = np.asarray(quad, np.float32).reshape(4, 2)
         side = float(np.mean([np.linalg.norm(q[i] - q[(i + 1) % 4])
@@ -770,7 +923,7 @@ def detect_grid_cells(frame, k1=0.0, k2=0.0):
                 or q[:, 0].max() > w - 1 - m or q[:, 1].max() > h - 1 - m):
             clipped += 1
             continue
-        cell = gt.cell_of_id(int(mid), cols, rows, base)
+        cell = gt.cell_of_id(int(mid), cols, rows)
         if cell is None:
             foreign += 1
             continue
@@ -790,9 +943,10 @@ def compute_homography_markers(matches, marker_model):
     marker that is half hidden - by a hand, a brush, the edge of the canvas -
     still gets read, and ArUco's error correction can turn the garbage into a
     VALID id: it happens, and the id it invents is a plausible one. Two things
-    catch it. The id ranges of the two boards are disjoint, so half of those
-    inventions are simply not on this board; and the rest are geometric
-    outliers, which is what RANSAC is for - one marker claiming to be a cell it
+    catch it. Most of the dictionary is on no board at all - the id lattice is
+    wider than the widest sheet - so a good share of those inventions are simply
+    not on this board; and the rest are geometric outliers, which is what
+    RANSAC is for - one marker claiming to be a cell it
     is not cannot agree with the others about where the board is. `inliers` is
     the subset that agreed, and it is what the line snap should be told about,
     because a cell key that is off by one puts every sample on the wrong
@@ -984,36 +1138,127 @@ def set_capture_mode(cap, w, h, settle=8, timeout=2.5):
 #  the squares genuinely straight-edged, so everything downstream - detection,
 #  the consensus quad, the homography - works on a proper pinhole image.
 #
-#  Only the two radial terms k1/k2 are exposed: they cover the bowing, and they
-#  can be dialled in by eye against the straight edges of the target, which the
-#  tangential terms cannot. The focal length is pinned to max(w,h), so k1 is
-#  O(0.1) for a typical webcam - a scale that is comfortable to tune by hand.
+#  k1/k2 are the two that can be dialled in by eye against the straight edges
+#  of the target. The focal length is pinned to max(w,h), so k1 is O(0.1) for a
+#  typical webcam - a scale that is comfortable to tune by hand. Pinning f
+#  costs nothing: a wrong f is absorbed exactly by rescaling k1/k2 (the model
+#  is a polynomial in r/f, so scaling f rescales the coefficients and leaves
+#  the mapping alone).
+#
+#  THE PRINCIPAL POINT IS NOT ABSORBED, and that is why the rest of the model
+#  is here too. Radial distortion is radial about the optical axis, and on a
+#  cheap module that axis is tens of pixels off the middle of the sensor.
+#  Correcting about the middle instead leaves a residual field that is not a
+#  homography, so H cannot swallow it - and it is not visible in any residual
+#  the line snap reports, because over the handful of cells in view the field
+#  is nearly affine and H absorbs it locally while the millimetres it implies
+#  somewhere else go quietly wrong. Measured on the synthetic bench (a 14x11
+#  board, a 320 mm span, an otherwise perfect lens): a principal point 35 px
+#  off centre costs 1.2 mm over the cells IN VIEW while the snap still reports
+#  0.04 mm. Fitting the centre brings that back to 0.16 mm.
+#
+#  So the model is the ordinary OpenCV one - k1, k2, k3 radial, p1/p2
+#  tangential, and a free principal point - fitted by 'a' in calibrate, which
+#  minimises the same collinearity residual as before over the marker corners.
+#  What the extra terms need is not a big improvement but a frame that can
+#  locate them at all: cells spread across it, not a close-up of three (see
+#  LENS_FIT_GAIN and lens_fit_possible).
+#
+#  k1/k2 stay function arguments because the calibrate window edits them by
+#  hand and the refinement solves for them; the rest is module state, like the
+#  target geometry, because it is a property of the camera rather than of any
+#  one call - and because threading five more arguments through the detector,
+#  the projection and the snap would only mean two of them could disagree.
 # ==========================================================================
 DIST_K1 = 0.0
 DIST_K2 = 0.0
 DIST_STEP = 0.01                   # k1/k2 increment per keypress in calibrate
 
-_undistort_maps = {}               # (w,h,k1,k2) -> (map1, map2); holds one entry
+LENS_K3 = 0.0                      # third radial term
+LENS_P1 = 0.0                      # tangential (decentering)
+LENS_P2 = 0.0
+LENS_CX = 0.0                      # principal point offset from the frame
+LENS_CY = 0.0                      # centre, in units of f = max(w,h)
+
+# What it takes for the extra terms to be kept. The spread is the test that
+# matters: the centre of a radial field can only be located by corners on
+# different sides of it, and k3 only by corners at different radii, so a fit off
+# a cluster in the middle of the frame is free to put the optical axis anywhere
+# and will. Given the spread, ANY improvement in the residual is worth taking -
+# which was not the guess. The guess was that five parameters fitted to one
+# frame would overfit and want a 15% improvement before being believed;
+# measured over 14 random viewpoints (synthtest --fit-lens, with and without
+# --lens), demanding 15% was worse in both worlds, including the one where the
+# lens really is two-parameter and the extras have nothing to find:
+#
+#   truth              threshold   error over the cells in view (mean / worst)
+#   centred k1/k2      15%         0.116 / 0.349 mm
+#   centred k1/k2      any gain    0.077 / 0.176 mm
+#   realistic lens     15%         0.259 / 0.842 mm
+#   realistic lens     any gain    0.152 / 0.842 mm
+#
+# Several hundred residuals over twenty-odd lines is simply a lot of evidence
+# for seven bounded parameters - but that is the whole of the reason, so it has
+# to be checked rather than assumed. Fifty residuals are not: the six-square
+# sheet gives 48, and on those the fit walks to its bounds (principal point
+# 259 px out, k3 = 0.84, both tangential terms pinned) to buy 2% of residual.
+# Hence LENS_FIT_MIN_TERMS, and hence refusing a fit that ends on a bound at
+# all: a parameter at its limit is one the frame did not determine.
+LENS_FIT_GAIN = 1.0                # the residual must drop, by anything
+LENS_FIT_SPREAD = 0.35             # corners must span this much of w AND of h
+LENS_FIT_MIN_CELLS = 6
+LENS_FIT_MIN_TERMS = 150           # corner-to-line residuals, i.e. ~20 cells
+
+_undistort_maps = {}               # cache key -> (map1, map2); holds one entry
+
+
+def lens_extras():
+    """The part of the lens that is module state: (k3, p1, p2, cx, cy)."""
+    return (LENS_K3, LENS_P1, LENS_P2, LENS_CX, LENS_CY)
+
+
+def set_lens_extras(k3=0.0, p1=0.0, p2=0.0, cx=0.0, cy=0.0):
+    global LENS_K3, LENS_P1, LENS_P2, LENS_CX, LENS_CY
+    LENS_K3, LENS_P1, LENS_P2 = float(k3), float(p1), float(p2)
+    LENS_CX, LENS_CY = float(cx), float(cy)
+    return lens_extras()
+
+
+def lens_is_extended():
+    return any(abs(v) > 1e-12 for v in lens_extras())
+
+
+def lens_hud(w=0, h=0):
+    """The extra terms, for the HUD and the log. Empty while they are all zero."""
+    if not lens_is_extended():
+        return ""
+    f = float(max(w, h)) or 1.0
+    px = f" c={LENS_CX * f:+.0f},{LENS_CY * f:+.0f}px" if (w and h) else ""
+    return (f"k3={LENS_K3:+.4f} p1={LENS_P1:+.5f} p2={LENS_P2:+.5f}{px}")
 
 
 def camera_matrix(w, h):
     f = float(max(w, h))
-    return np.array([[f, 0.0, w / 2.0],
-                     [0.0, f, h / 2.0],
+    return np.array([[f, 0.0, w / 2.0 + LENS_CX * f],
+                     [0.0, f, h / 2.0 + LENS_CY * f],
                      [0.0, 0.0, 1.0]], np.float64)
 
 
 def dist_coeffs(k1, k2):
-    return np.array([k1, k2, 0.0, 0.0, 0.0], np.float64)
+    return np.array([k1, k2, LENS_P1, LENS_P2, LENS_K3], np.float64)
 
 
 def distort_points(pts, k1, k2, w, h):
-    """Apply the radial model to points (inverse of undistort_points)."""
+    """Apply the lens model to points (inverse of undistort_points)."""
     pts = np.asarray(pts, np.float64).reshape(-1, 2)
-    f, cx, cy = float(max(w, h)), w / 2.0, h / 2.0
-    xy = (pts - [cx, cy]) / f
-    r2 = (xy ** 2).sum(axis=1, keepdims=True)
-    return (xy * (1.0 + k1 * r2 + k2 * r2 ** 2) * f + [cx, cy]).astype(np.float32)
+    f = float(max(w, h))
+    c = [w / 2.0 + LENS_CX * f, h / 2.0 + LENS_CY * f]
+    x, y = ((pts - c) / f).T
+    r2 = x * x + y * y
+    rad = 1.0 + k1 * r2 + k2 * r2 ** 2 + LENS_K3 * r2 ** 3
+    xd = x * rad + 2 * LENS_P1 * x * y + LENS_P2 * (r2 + 2 * x * x)
+    yd = y * rad + LENS_P1 * (r2 + 2 * y * y) + 2 * LENS_P2 * x * y
+    return (np.stack([xd, yd], axis=1) * f + c).astype(np.float32)
 
 
 def undistort_points(pts, k1, k2, w, h):
@@ -1033,6 +1278,10 @@ def auto_distortion(matches, w, h, k1_cur=0.0, k2_cur=0.0):
     candidate, which costs microseconds, so a coarse-to-fine sweep is instant
     even at 2592x1944. The result is a starting point - the manual keys still
     refine it against what the image actually looks like.
+
+    Only k1/k2, and only about the middle of the frame: the extras stay
+    wherever they are. fit_lens() is the one that fits the whole model, and it
+    starts here.
 
     Caveat: the target only covers part of the frame, so k1/k2 are constrained
     over that radial range and extrapolate less well to the far corners. It
@@ -1062,16 +1311,162 @@ def auto_distortion(matches, w, h, k1_cur=0.0, k2_cur=0.0):
     return best
 
 
+def lens_fit_possible(matches, w, h):
+    """Whether this frame can support the full model. Returns (ok, why)."""
+    if len(matches) < LENS_FIT_MIN_CELLS:
+        return False, (f"{len(matches)} cells in view, {LENS_FIT_MIN_CELLS} "
+                       f"needed")
+    pts = np.vstack([q for (_, _, q) in matches])
+    sx = float(np.ptp(pts[:, 0])) / w
+    sy = float(np.ptp(pts[:, 1])) / h
+    if min(sx, sy) < LENS_FIT_SPREAD:
+        return False, (f"the cells cover {sx * 100:.0f}%x{sy * 100:.0f}% of the "
+                       f"frame, {LENS_FIT_SPREAD * 100:.0f}% of each is needed")
+    rows = len({r for (_, r, _) in matches})
+    cols = len({c for (c, _, _) in matches})
+    if rows < 2 or cols < 2:
+        return False, f"{cols} column(s) and {rows} row(s) of cells - need 2 of each"
+    return True, ""
+
+
+def fit_lens(matches, w, h, k1_cur=0.0, k2_cur=0.0):
+    """Fit the whole lens - k1, k2, k3, p1, p2 and the principal point.
+
+    Two stages, because the second one needs a starting point it can trust:
+    auto_distortion()'s sweep for k1/k2, then Levenberg-Marquardt over all
+    seven parameters against the same per-corner collinearity residuals. The
+    Jacobian is finite-difference; seven parameters against several hundred
+    residuals costs a few milliseconds.
+
+    The extras are only adopted if the frame passes lens_fit_possible() and they
+    improve the residual (see LENS_FIT_GAIN); otherwise they are zeroed and this
+    is auto_distortion() with a longer report. Either way the module state is
+    left consistent with what is returned, because that state is what
+    undistort() and the projection read.
+
+    Returns (k1, k2, info) with info carrying both residuals, the decision and
+    why - everything the caller needs to say what happened."""
+    info = {"n": len(matches), "took": False, "why": "", "r2": float("nan"),
+            "r7": float("nan")}
+    if not matches:
+        return k1_cur, k2_cur, info
+    shape = [(col, row) for (col, row, _) in matches]
+    flat = np.vstack([q for (_, _, q) in matches])
+    raw = distort_points(flat, k1_cur, k2_cur, w, h)   # back to sensor coords
+    keep = lens_extras()
+
+    def terms(v):
+        """Per-corner distance to the line the corner belongs on, in px."""
+        set_lens_extras(*v[2:])
+        u = undistort_points(raw, v[0], v[1], w, h)
+        return collinearity_terms(
+            [(c, r, u[i * 4:(i + 1) * 4]) for i, (c, r) in enumerate(shape)])
+
+    def score(v):
+        t = terms(v)
+        return float(np.mean(np.abs(t))) if len(t) else float("inf")
+
+    # stage 1: k1/k2 about the frame centre, nothing else
+    set_lens_extras()
+    k1, k2, r2 = auto_distortion(matches, w, h, k1_cur, k2_cur)
+    info["r2"] = r2
+    ok, why = lens_fit_possible(matches, w, h)
+    if not ok:
+        info["why"] = why
+        set_lens_extras()
+        return k1, k2, info
+
+    # stage 2: everything, from there
+    v = np.array([k1, k2, 0.0, 0.0, 0.0, 0.0, 0.0])
+    # steps big enough to move a corner by ~0.1 px, small enough to be linear
+    step = np.array([2e-3, 2e-3, 2e-3, 2e-5, 2e-5, 2e-4, 2e-4])
+    # Bounds as plausibility, not as slack. A principal point 5% of the frame
+    # off centre is already a lot of camera; k3 beyond +-0.5 or tangential terms
+    # beyond +-0.01 are not lenses, they are fits that ran away.
+    lo = np.array([-1.0, -1.0, -0.5, -0.01, -0.01, -0.05, -0.05])
+    hi = -lo
+    r = terms(v)
+    if len(r) < LENS_FIT_MIN_TERMS:
+        info["why"] = (f"{len(r)} corner-to-line residuals, "
+                       f"{LENS_FIT_MIN_TERMS} needed to pin seven parameters")
+        set_lens_extras()
+        return k1, k2, info
+    cost, lam = float(r @ r), 1e-3
+    for _ in range(40):
+        J = np.empty((len(r), 7))
+        for j in range(7):
+            e = np.zeros(7); e[j] = step[j]
+            J[:, j] = (terms(v + e) - terms(v - e)) / (2 * step[j])
+        A = J.T @ J
+        g = J.T @ r
+        d = np.linalg.lstsq(A + lam * np.diag(np.diag(A) + 1e-12), -g,
+                            rcond=None)[0]
+        vn = np.clip(v + d, lo, hi)
+        rn = terms(vn)
+        cn = float(rn @ rn)
+        if cn < cost:
+            v, r, cost, lam = vn, rn, cn, max(lam * 0.4, 1e-9)
+            if np.abs(d / step).max() < 1.0:
+                break
+        else:
+            lam *= 6.0
+            if lam > 1e8:
+                break
+    r7 = score(v)
+    info["r7"] = r7
+    if not (r7 < LENS_FIT_GAIN * r2):
+        info["why"] = (f"the extra terms did not improve the residual "
+                       f"({r2:.3f} -> {r7:.3f} px)")
+        set_lens_extras()
+        return k1, k2, info
+    pinned = [n for n, x, a, b in zip(("k1", "k2", "k3", "p1", "p2", "cx", "cy"),
+                                      v, lo, hi)
+              if min(abs(x - a), abs(x - b)) < 1e-9]
+    if pinned:
+        info["why"] = (f"the fit ran to the limit of {', '.join(pinned)}, which "
+                       f"means this frame does not determine "
+                       f"{'them' if len(pinned) > 1 else 'it'}")
+        set_lens_extras()
+        return k1, k2, info
+    set_lens_extras(*v[2:])
+    info["took"] = True
+    return float(v[0]), float(v[1]), info
+
+
+def lens_fit_report(k1, k2, info, w, h, what="markers"):
+    """Print what fit_lens() decided, and return (k1, k2) for the caller.
+
+    The two residuals are the honest part of this: the collinearity number is
+    the only one that sees a mis-modelled lens at all. The line snap's
+    millimetres do not - it reports the same 0.04 mm whether the principal
+    point is right or 35 px out, because over the cells in view the error it
+    cannot model is nearly affine and H absorbs it."""
+    print(f"[calib] lens fit over {info['n']} {what}: k1={k1:+.4f} k2={k2:+.4f}"
+          f"  (straight-line residual {info['r2']:.3f} px)")
+    if info["took"]:
+        print(f"        + {lens_hud(w, h)}\n"
+              f"        the extra terms cut it to {info['r7']:.3f} px, so they "
+              f"are kept. A principal point that far off centre is a millimetre "
+              f"or so\n"
+              f"        of canvas that no homography can absorb and no line "
+              f"snap can see.")
+    elif info["why"]:
+        print(f"        k1/k2 only: {info['why']}.")
+    return k1, k2
+
+
 def undistort(frame, k1, k2):
-    """Remove radial distortion, keeping the camera matrix (and hence the
+    """Remove the lens distortion, keeping the camera matrix (and hence the
     framing and the center scale) unchanged.
 
-    The remap is a per-frame cost on a 2592x1944 image, so k1=k2=0 short-circuits
-    to the original frame and the maps are built only when the params change."""
-    if abs(k1) < 1e-9 and abs(k2) < 1e-9:
+    The remap is a per-frame cost on a 2592x1944 image, so an undistorted lens
+    short-circuits to the original frame and the maps are built only when the
+    parameters change."""
+    if abs(k1) < 1e-9 and abs(k2) < 1e-9 and not lens_is_extended():
         return frame
     h, w = frame.shape[:2]
-    key = (w, h, round(k1, 6), round(k2, 6))
+    key = (w, h, round(k1, 6), round(k2, 6)) + tuple(
+        round(v, 8) for v in lens_extras())
     maps = _undistort_maps.get(key)
     if maps is None:
         K = camera_matrix(w, h)
@@ -1354,16 +1749,19 @@ def consensus_quad(matches):
     return np.array(corners, np.float32), lines, bounds
 
 
-def collinearity_residual(matches):
-    """Mean distance (px) from corners to the grid line they should lie on.
+def collinearity_terms(matches):
+    """SIGNED distance (px) of every corner from the line it should lie on.
 
     Every row of the target contributes two physically straight lines (the top
     and bottom edges of its squares) and every column two more, each sampled by
     several corners. On an ideal pinhole image those corners are exactly
     collinear, so what is left is detection noise plus whatever lens distortion
-    is still uncorrected - which makes this number the thing to minimize when
-    tuning k1/k2 by hand. Lines with fewer than 3 points are skipped: two points
-    always fit perfectly and would only dilute the average."""
+    is still uncorrected - which makes these the residuals to minimize when
+    fitting the lens. Lines with fewer than 3 points are skipped: two points
+    always fit perfectly and would only dilute the answer.
+
+    Signed, and one entry per corner, because that is what a least-squares fit
+    needs; collinearity_residual() is the same thing as one number."""
     groups = {}
     for (col, row, quad) in matches:
         tl, tr, br, bl = quad
@@ -1381,8 +1779,14 @@ def collinearity_residual(matches):
             continue
         vx, vy, x0, y0 = ln
         for p in pts:
-            dists.append(abs((p[0] - x0) * vy - (p[1] - y0) * vx))
-    return float(np.mean(dists)) if dists else float("nan")
+            dists.append((p[0] - x0) * vy - (p[1] - y0) * vx)
+    return np.asarray(dists, np.float64)
+
+
+def collinearity_residual(matches):
+    """Mean distance (px) from corners to the grid line they should lie on."""
+    d = collinearity_terms(matches)
+    return float(np.mean(np.abs(d))) if len(d) else float("nan")
 
 
 def outer_world_quad(model, bounds=None):
@@ -2127,6 +2531,7 @@ def calibrate(cap, model):
             kstep = min(1.0, kstep * 2.0)
         elif key == ord('0'):
             k1 = k2 = 0.0
+            set_lens_extras()
         elif thickness_key(key):
             pass
         elif key == ord('e'):
@@ -2138,11 +2543,9 @@ def calibrate(cap, model):
                           k1, k2, keys=set((c, r) for (c, r, _) in matches),
                           frame=raw, ink_mm=rinfo.get("ink_mm"))
         elif key == ord('a'):
-            nk1, nk2, r = auto_distortion(matches, frame.shape[1],
-                                          frame.shape[0], k1, k2)
-            print(f"[calib] auto distortion: k1={nk1:+.4f} k2={nk2:+.4f} "
-                  f"(residual {res:.3f} -> {r:.3f} px, over {len(matches)} squares)")
-            k1, k2 = nk1, nk2
+            k1, k2 = lens_fit_report(*fit_lens(matches, frame.shape[1],
+                                              frame.shape[0], k1, k2),
+                                     frame.shape[1], frame.shape[0], "squares")
         if key == ord('c'):
             H_pts = compute_homography(matches, model)
             H_con, cq, _ = compute_homography_consensus(matches, model)
@@ -2181,7 +2584,8 @@ def calibrate(cap, model):
                           "- saving the corner fit.")
             np.savez(CALIB_FILE, H=H, px_per_mm=PX_PER_MM,
                      canvas_w=CANVAS_W, canvas_h=CANVAS_H,
-                     k1=k1, k2=k2, model_sig=model_signature(),
+                     k1=k1, k2=k2, lens=np.array(lens_extras()),
+                     model_sig=model_signature(),
                      cam_w=frame.shape[1], cam_h=frame.shape[0],
                      target="squares", thickness=TARGET_THICKNESS_MM)
             DIST_K1, DIST_K2 = k1, k2
@@ -2236,7 +2640,7 @@ def calibrate_grid(cap):
     global DIST_K1, DIST_K2, TARGET_THICKNESS_MM
     cell_model = build_grid_cell_model()
     marker_model = build_grid_marker_model()
-    cols, rows, base = gt.board_spec(GRID_BOARD)
+    cols, rows = gt.board_spec(GRID_BOARD)
 
     win = "calibrate (grid)"
     make_window(win)
@@ -2266,16 +2670,7 @@ def calibrate_grid(cap):
               "the border stops short of the edge, measure the two gaps and pass "
               "--grid-anchor-x/-y (negative) - nothing in the frame can catch "
               "this for you.")
-    print(f"[calib] {GRID_BOARD} grid: {cols}x{rows} cells of "
-          f"{gt.CELL_MM:.1f} mm, marker ids {base}..{base + cols * rows - 1}.\n"
-          "        Aim anywhere on the board - two or three cells are enough.\n"
-          "        Green outlines are recognised markers, labelled with the\n"
-          "        cell they are; cyan is the fitted grid snapped onto the ink,\n"
-          "        and 'snap' is how far it still misses, in mm on the paper.\n"
-          "        'a' auto-fits the lens distortion, 1/2 3/4 tune k1/k2 by\n"
-          "        hand, 5/6 change the step, 0 resets it, 'e' toggles the\n"
-          "        snap, 'r' lets it retune k1/k2, '['/']' set the thickness\n"
-          "        of the board it is printed on, 'v' reports, 'c' saves.")
+    print(grid_intro())
     print(thickness_intro())
 
     while True:
@@ -2328,6 +2723,9 @@ def calibrate_grid(cap):
                f"   board corner at ({GRID_ANCHOR_X_MM:+.0f},{GRID_ANCHOR_Y_MM:+.0f})mm"
                f" from the canvas corner   "
                f"{thickness_hud(H_show, H_canvas, frame.shape[1], frame.shape[0])}",
+               (f"lens: {lens_hud(frame.shape[1], frame.shape[0])}"
+                if lens_is_extended() else
+                "lens: k1/k2 about the frame centre only ('a' fits the rest)"),
                (f"snap={rinfo['rms_mm']:.3f} mm ({rinfo['rms_px']:.2f} px) on "
                 f"{rinfo['n']}/{rinfo['n_total']} pts  "
                 f"ink={2 * rinfo['ink_mm']:.2f}mm"
@@ -2362,6 +2760,7 @@ def calibrate_grid(cap):
             kstep = min(1.0, kstep * 2.0)
         elif key == ord('0'):
             k1 = k2 = 0.0
+            set_lens_extras()
         elif thickness_key(key):
             pass
         elif key == ord('e'):
@@ -2376,11 +2775,9 @@ def calibrate_grid(cap):
             # in one row of cells have collinear top edges, markers in one
             # column have collinear left edges, which is all the residual needs
             if len(matches) >= 2:
-                nk1, nk2, r = auto_distortion(matches, frame.shape[1],
-                                              frame.shape[0], k1, k2)
-                print(f"[calib] auto distortion: k1={nk1:+.4f} k2={nk2:+.4f} "
-                      f"(line residual -> {r:.3f} px, over {len(matches)} markers)")
-                k1, k2 = nk1, nk2
+                k1, k2 = lens_fit_report(*fit_lens(matches, frame.shape[1],
+                                                  frame.shape[0], k1, k2),
+                                         frame.shape[1], frame.shape[0])
             else:
                 print("[calib] auto distortion needs at least 2 markers in view "
                       "(and really wants them spread across the frame).")
@@ -2414,9 +2811,10 @@ def calibrate_grid(cap):
                           "less. Get more of the grid into the frame.")
             np.savez(CALIB_FILE, H=H, px_per_mm=PX_PER_MM,
                      canvas_w=CANVAS_W, canvas_h=CANVAS_H,
-                     k1=k1, k2=k2, model_sig=model_signature(),
+                     k1=k1, k2=k2, lens=np.array(lens_extras()),
+                     model_sig=model_signature(),
                      cam_w=frame.shape[1], cam_h=frame.shape[0],
-                     target="grid", board=GRID_BOARD,
+                     target="grid", board=GRID_BOARD, board_rev=gt.ID_REV,
                      grid_anchor=np.array([GRID_ANCHOR_X_MM, GRID_ANCHOR_Y_MM]),
                      thickness=TARGET_THICKNESS_MM)
             DIST_K1, DIST_K2 = k1, k2
@@ -2426,7 +2824,8 @@ def calibrate_grid(cap):
             n, nc, nr, span = grid_view_span(matches)
             print(f"[calib] homography saved to {CALIB_FILE} "
                   f"(grid {GRID_BOARD}, {n} markers over {nc}x{nr} cells, "
-                  f"span {span:.0f} mm, k1={k1:+.4f} k2={k2:+.4f})")
+                  f"span {span:.0f} mm, k1={k1:+.4f} k2={k2:+.4f}"
+                  f"{', ' + lens_hud(frame.shape[1], frame.shape[0]) if lens_is_extended() else ''})")
             print(thickness_save_note(H, H_saved, frame.shape[1], frame.shape[0]))
             print(f"[calib] marker reprojection error: "
                   f"{reprojection_error(matches, marker_model, H):.2f} px")
@@ -2455,12 +2854,15 @@ def grid_probe(frame, out="grid_probe.png"):
         bits. That is resolution or blur: a 4x4 marker has 6 modules a side and
         needs roughly 4-5 px per module, so about 30 px of marker side, and
         real optics want more.
-      * decoded, wrong board - the ids came out fine but belong to the other
-        printed board, i.e. --board names the wrong sheet.
+      * decoded, wrong board - the ids came out fine and are on no board this
+        size, i.e. --board names a sheet that is not the one on the wall. A
+        BIGGER sheet than the one named is fine and says so: its ids over the
+        named area are that board's ids, and the ones beyond it are foreign
+        without anything being wrong.
 
     The rejected-candidate count is the one number that separates the first two,
     and it is right there in the detector's third return value."""
-    cols, rows, base = gt.board_spec(GRID_BOARD)
+    cols, rows = gt.board_spec(GRID_BOARD)
     gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape[:2]
     lap = float(cv2.Laplacian(gray, cv2.CV_64F).var())
@@ -2468,13 +2870,42 @@ def grid_probe(frame, out="grid_probe.png"):
           f"{gray.min()}/{gray.mean():.0f}/{gray.max()}  focus(lapvar) {lap:.0f}"
           + ("   <- LOW: out of focus, or the frame is flat/dark"
              if lap < 60 else ""))
-    print(f"[probe] configured board: {GRID_BOARD} = {cols}x{rows} cells, "
-          f"ids {base}..{base + cols * rows - 1}, "
-          f"{gt.MARKER_MM} mm markers in {gt.CELL_MM} mm cells")
-
     corners, ids, rejected = aruco_detector().detectMarkers(gray)
     n_rej = 0 if rejected is None else len(rejected)
     ids = np.zeros(0, np.int32) if ids is None else ids.reshape(-1)
+
+    # Which revision the ink is, before anything is said about which ids are on
+    # the board - the answer depends on it. In the probe both revisions are
+    # reported whether or not they had to be told apart: "the ids fit rev 1 and
+    # not rev 2" is the diagnosis for a board that used to work and stopped.
+    resolve_board_rev(ids, cols, rows, announce=False)
+    revs = {}
+    for rev in sorted({1, gt.TEMPLATE_REV}):
+        try:
+            revs[rev] = sum(1 for m in ids
+                            if gt.cell_of_id(int(m), cols, rows, rev=rev))
+        except ValueError:
+            revs[rev] = None            # no board of this size at that revision
+    ids_on = gt.board_ids(GRID_BOARD)
+    print(f"[probe] configured board: {GRID_BOARD} = {cols}x{rows} cells, "
+          f"{len(ids_on)} ids within {min(ids_on)}..{max(ids_on)}, "
+          f"{gt.MARKER_MM} mm markers in {gt.CELL_MM} mm cells")
+    # which revision the ids themselves vote for, whatever we were told
+    voted = max((r for r, n in revs.items() if n), key=lambda r: revs[r],
+                default=None)
+    print(f"[probe] template revision: reading as rev {gt.ID_REV}"
+          + (" (--board-rev)" if not BOARD_REV_AUTO else "")
+          + "   ids that fit: "
+          + ", ".join(f"rev {r} " + ("n/a at this size" if n is None else f"{n}")
+                      for r, n in revs.items())
+          + (f"   <- a rev 1 sheet: printed before the ids moved to the shared "
+             f"lattice. It still works, at its own size."
+             if voted == 1 and gt.ID_REV == 1 else
+             f"   <- but the ids fit rev {voted} far better. Drop --board-rev, "
+             f"or pass --board-rev {voted}."
+             if voted and revs.get(gt.ID_REV) is not None
+             and revs[voted] >= 2 * max(1, revs[gt.ID_REV]) else ""))
+
     print(f"[probe] tuned detector: {len(ids)} decoded, {n_rej} candidates "
           f"rejected before decoding")
 
@@ -2491,20 +2922,24 @@ def grid_probe(frame, out="grid_probe.png"):
                                 for i in range(4)])) for q in corners]
         on, off = [], []
         for mid in ids:
-            (on if gt.cell_of_id(int(mid), cols, rows, base) else off).append(int(mid))
+            (on if gt.cell_of_id(int(mid), cols, rows) else off).append(int(mid))
         print(f"[probe] marker side in px: min {min(sides):.0f} "
               f"median {np.median(sides):.0f} max {max(sides):.0f}"
               + ("   <- SMALL: under ~30 px a 4x4 marker is a coin toss"
                  if min(sides) < 30 else ""))
         print(f"[probe] {len(on)} ids on the {GRID_BOARD} board, {len(off)} not")
         if off:
-            other = [n for n, (c, r, b) in gt.BOARDS.items()
-                     if any(b <= m < b + c * r for m in off)]
+            # the smallest boards that hold ALL of them - if the sheet on the
+            # wall is one of those, the ids are not wrong, --board is
+            fits = [n for n in gt.boards_with_id(min(off))
+                    if all(gt.cell_of_id(m, *gt.BOARDS[n]) for m in set(off))]
             print(f"[probe] ids not on this board: {sorted(set(off))[:12]}"
-                  + (f"   <- those are the {'/'.join(other)} board(s). "
-                     f"Use --board {other[0]}." if other else
-                     "   <- not on any known board: a misread, or a stray "
-                     "ArUco marker in view."))
+                  + (f"   <- all of those are on {'/'.join(fits)}, so the sheet "
+                     f"is bigger than --board {GRID_BOARD} says. Harmless if "
+                     f"deliberate; --board {fits[0]} would use them too."
+                     if fits else
+                     "   <- on no known board at this revision: a misread, a "
+                     "stray ArUco marker in view, or the wrong --board-rev."))
     elif n_rej:
         print("[probe] squares were found but none decoded - too few pixels per "
               "module, or too much blur. Move the camera closer, focus it, or "
@@ -2521,7 +2956,7 @@ def grid_probe(frame, out="grid_probe.png"):
     kept, foreign, clipped = detect_grid_cells(frame)
     print(f"[probe] calibrate would use {len(kept)} of them"
           + (f"  ({clipped} dropped at the frame edge)" if clipped else "")
-          + (f"  ({foreign} on another board)" if foreign else "")
+          + (f"  ({foreign} outside this board)" if foreign else "")
           + (f"  cells {sorted((c, r) for (c, r, _) in kept)[:8]}" if kept else ""))
 
     vis = frame.copy() if frame.ndim == 3 else cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
@@ -2530,7 +2965,7 @@ def grid_probe(frame, out="grid_probe.png"):
             cv2.polylines(vis, [np.round(q).astype(np.int32)], True,
                           (0, 0, 255), 2, cv2.LINE_AA)
     for q, mid in zip(corners, ids):
-        ok = gt.cell_of_id(int(mid), cols, rows, base)
+        ok = gt.cell_of_id(int(mid), cols, rows)
         cv2.polylines(vis, [np.round(q).astype(np.int32)], True,
                       (0, 220, 0) if ok else (0, 160, 255), 3, cv2.LINE_AA)
         cv2.putText(vis, str(int(mid)),
@@ -2831,17 +3266,52 @@ def load_calibration():
             use_grid_target(str(data["board"]) if "board" in data else None)
             print(f"[calib] {CALIB_FILE} was made with the {GRID_BOARD} grid "
                   f"target - using it (--target squares overrides).")
+    # Which template revision the sheet is travels with the calibration too: it
+    # is a property of the ink that was measured. A file written before the
+    # revisions existed was necessarily made against a rev 1 sheet - but say so
+    # rather than assume it, and leave auto-detection to correct it if the sheet
+    # has since been reprinted.
+    if not BOARD_REV_EXPLICIT and TARGET == "grid":
+        if "board_rev" in data:
+            set_board_rev(int(data["board_rev"]))
+        elif "board" in data and GRID_BOARD in gt.legacy_boards():
+            set_board_rev(1)
+            print(f"[calib] {CALIB_FILE} predates the template revisions, so "
+                  f"the sheet it was fitted to is a rev 1 print - reading ids "
+                  f"that way.\n"
+                  f"        --board-rev {gt.TEMPLATE_REV} if you have "
+                  f"reprinted, --board-rev auto to work it out per frame.")
     # the mounting offset travels with the calibration for the same reason the
     # board does: the two only mean anything together
     if not GRID_ANCHOR_EXPLICIT and "grid_anchor" in data:
         GRID_ANCHOR_X_MM, GRID_ANCHOR_Y_MM = (float(v) for v in data["grid_anchor"])
         GRID_ANCHOR_FROM_FILE = bool(GRID_ANCHOR_X_MM or GRID_ANCHOR_Y_MM)
+    elif GRID_ANCHOR_EXPLICIT and "grid_anchor" in data:
+        fx, fy = (float(v) for v in data["grid_anchor"])
+        if abs(fx - GRID_ANCHOR_X_MM) > 0.5 or abs(fy - GRID_ANCHOR_Y_MM) > 0.5:
+            # The commonest way to make every millimetre here wrong while every
+            # diagnostic still reads perfect. H was fitted in the frame the
+            # calibration's anchor defines; give a different one now and the
+            # whole canvas moves by the difference, silently, because nothing
+            # in the frame marks the canvas corner (see GRID_ANCHOR_X_MM).
+            print(f"[calib] !! MOUNTING OFFSET CONFLICT: --grid-anchor says "
+                  f"({GRID_ANCHOR_X_MM:+.1f},{GRID_ANCHOR_Y_MM:+.1f}) mm, "
+                  f"{CALIB_FILE} was fitted with ({fx:+.1f},{fy:+.1f}) mm.\n"
+                  f"        Everything drawn on the canvas will land "
+                  f"({GRID_ANCHOR_X_MM - fx:+.1f},{GRID_ANCHOR_Y_MM - fy:+.1f}) "
+                  f"mm out. Drop the flags to use the calibration's own "
+                  f"figure,\n"
+                  f"        or recalibrate with the one you mean.")
     # the thickness travels with the calibration too, for the same reason
     if not THICKNESS_EXPLICIT and "thickness" in data:
         TARGET_THICKNESS_MM = float(data["thickness"])
         THICKNESS_FROM_FILE = bool(TARGET_THICKNESS_MM)
     DIST_K1 = float(data["k1"]) if "k1" in data else 0.0
     DIST_K2 = float(data["k2"]) if "k2" in data else 0.0
+    # The rest of the lens. A file without it was fitted with the two-parameter
+    # model, and zeroing the extras is what reproduces that fit exactly - the
+    # lens is only ever right together with the H that was measured through it.
+    set_lens_extras(*(data["lens"] if "lens" in data else ()))
     CALIB_CAM_W = int(data["cam_w"]) if "cam_w" in data else 0
     CALIB_CAM_H = int(data["cam_h"]) if "cam_h" in data else 0
     # H is only meaningful together with the sheet geometry it was fitted to:
@@ -2879,9 +3349,10 @@ def scale_homography(H, from_wh, to_wh):
     visual - the contours either still land on the printed squares or they do
     not.
 
-    k1/k2 need no retarget: camera_matrix pins f to max(w,h) and the principal
-    point to the frame center, so the distortion model is expressed in units of
-    the frame itself and survives any uniform change of resolution."""
+    The lens needs no retarget: camera_matrix pins f to max(w,h) and holds the
+    principal point offset in units of f too, so the whole distortion model is
+    expressed in units of the frame itself and survives any uniform change of
+    resolution."""
     sx = to_wh[0] / float(from_wh[0])
     sy = to_wh[1] / float(from_wh[1])
     return np.diag([sx, sy, 1.0]) @ H
@@ -3153,8 +3624,23 @@ def ref_to_world(ref_w, ref_h, dx, dy, sx, sy, theta_deg):
     return T2 @ Rs @ T1 @ S0
 
 
+def adjust_file(spec):
+    """--adjust as a path, or None for 'no manual adjustment at all'.
+
+    A named file that does not exist yet works too - it loads as zeros and 'p'
+    creates it - but it is a poor way to ASK for zeros, because it only means
+    zeros on the machine where it happens to be missing. `--adjust none` says it
+    outright, which is the difference between a command that reproduces and a
+    command that reproduced once."""
+    if spec is None or str(spec).strip().lower() in ("none", "off", "no", ""):
+        return None
+    return str(spec)
+
+
 def load_overlay_adjust(path):
     """Return (dx,dy,sx,sy,theta,alpha). Compatible with the old format (single 's')."""
+    if path is None:
+        return 0.0, 0.0, 1.0, 1.0, 0.0, 0.5
     try:
         d = np.load(path)
     except FileNotFoundError:
@@ -3173,6 +3659,7 @@ def load_overlay_adjust(path):
 
 
 def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
+    adjust_path = adjust_file(adjust_path)
     H = load_calibration()
     if H is None:
         print(f"[overlay] no {CALIB_FILE} - run calibrate first."); return
@@ -3235,7 +3722,10 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
               f"rot={theta:+.1f}deg\n"
               f"          If the reference lands offset and you did not put it "
               f"there, this is why. Press 'i' to zero it (then 'p' to save), or "
-              f"pass --adjust with a fresh file.")
+              f"start over with --adjust none.")
+    elif adjust_path is None:
+        print("[overlay] --adjust none: the reference is placed by the "
+              "calibration alone, and nothing is loaded or saved.")
     color_i = 0
     show = True
     show_help = True
@@ -3473,7 +3963,7 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
                    f"alpha={alpha:.2f}  zoom={view['z']:.1f}x  "
                    f"Canny={canny_lo}/{canny_hi}  overlay={'on' if show else 'off'}  "
                    f"view={'corrected' if rectified else 'raw (perspective)'}"
-                   f"{'' if (DIST_K1 or DIST_K2) else ' no-undistort'}"
+                   f"{'' if (DIST_K1 or DIST_K2 or lens_is_extended()) else ' no-undistort'}"
                    # not adjustable here - H is already folded into the warp -
                    # but it is the number to suspect if everything lands the
                    # same small distance out in the same direction
@@ -3564,8 +4054,13 @@ def overlay(cap, ref_path, adjust_path=OVERLAY_ADJUST_FILE):
                   + ("  (contours are unchanged - Canny sees the same edges)"
                      if render_mode == "contours" else ""))
         elif k == ord('p'):
-            np.savez(adjust_path, dx=dx, dy=dy, sx=sx, sy=sy, theta=theta, alpha=alpha)
-            print(f"[overlay] adjustment saved to {adjust_path}")
+            if adjust_path is None:
+                print("[overlay] --adjust none: there is nowhere to save the "
+                      "adjustment. Restart with --adjust FILE.npz to keep it.")
+            else:
+                np.savez(adjust_path, dx=dx, dy=dy, sx=sx, sy=sy, theta=theta,
+                         alpha=alpha)
+                print(f"[overlay] adjustment saved to {adjust_path}")
         elif k == ord('n'):
             # take the snapshot with nothing in front of the camera, then go
             # draw: mode on straight away, since that is always what follows
@@ -3636,6 +4131,12 @@ def generate_template(out_path, ppm=4.0):
     A reference traced over a photo of the sheet by hand is good to a few
     tenths of a millimetre at best, and its errors are indistinguishable from
     the ones being hunted.
+
+    Which is exactly why the mounting offset has to be the calibration's own
+    (main() loads it for this mode): the sheet is drawn where the board is
+    mounted, not where a default says it is. Draw it flush against a board that
+    is mounted 10 mm in and the check fails by 10 mm, and every explanation
+    reached for - the lens, the snap, the print scale - is the wrong one.
     """
     W = int(round(CANVAS_W * ppm))
     H = int(round(CANVAS_H * ppm))
@@ -3649,12 +4150,12 @@ def generate_template(out_path, ppm=4.0):
         # the markers too, so the template is the whole printed sheet and not
         # just its lines - overlaid on the real one, a marker that lands half a
         # cell off is a great deal easier to see than a line that does
-        cols, rows, base = gt.board_spec(GRID_BOARD)
+        cols, rows = gt.board_spec(GRID_BOARD)
         ox, oy = grid_origin_mm()
         m = gt.MARKER_MM / gt.ARUCO_MODULES
         for row in range(rows):
             for col in range(cols):
-                bits = gt.marker_bits(gt.marker_id(col, row, cols, base))
+                bits = gt.marker_bits(gt.marker_id(col, row, cols, rows))
                 mx, my, _, _ = gt.marker_rect_mm(col, row)
                 for r in range(gt.ARUCO_MODULES):
                     for c in range(gt.ARUCO_MODULES):
@@ -3670,6 +4171,20 @@ def generate_template(out_path, ppm=4.0):
     cv2.imwrite(out_path, img)
     print(f"[gen-template] saved {out_path}  ({W}x{H}px, {ppm} px/mm, "
           f"canvas {CANVAS_W:.0f}x{CANVAS_H:.0f}mm)")
+    if TARGET == "grid":
+        cols, rows = gt.board_spec(GRID_BOARD)
+        print(f"[gen-template] the {GRID_BOARD} board is drawn with its "
+              f"bottom-right corner ({GRID_ANCHOR_X_MM:+.1f},"
+              f"{GRID_ANCHOR_Y_MM:+.1f}) mm from the canvas corner"
+              + (" (from the calibration file)" if GRID_ANCHOR_FROM_FILE else "")
+              + ".\n               This must be the offset the calibration was "
+                "fitted with, or the check is off by the difference.")
+        if cols * gt.CELL_MM > CANVAS_W + 0.5 or rows * gt.CELL_MM > CANVAS_H + 0.5:
+            print(f"[gen-template] NOTE: the board is bigger than the canvas, so "
+                  f"the template is cropped to the canvas. Only the part of the "
+                  f"printed sheet\n"
+                  f"               that is ON the canvas can be checked - the "
+                  f"rest of the sheet is outside the picture by construction.")
 
 
 def list_devices():
@@ -3714,6 +4229,7 @@ def main():
     global PX_PER_MM, CANVAS_W, CANVAS_H, REQ_WIDTH, REQ_HEIGHT, DISPLAY_MAX
     global FIT_MODE, DIST_K1, DIST_K2, FULLSCREEN, DISPLAY_TARGET, KEEP_AWAKE
     global TARGET_EXPLICIT, GRID_ANCHOR_X_MM, GRID_ANCHOR_Y_MM, GRID_ANCHOR_EXPLICIT
+    global BOARD_REV_EXPLICIT
     global TARGET_THICKNESS_MM, THICKNESS_EXPLICIT
     ap = argparse.ArgumentParser(description="Canvas perspective calibration/rectification")
     ap.add_argument("mode", choices=["calibrate", "run", "overlay", "gen-template",
@@ -3759,7 +4275,20 @@ def main():
                     help=f"which printed grid ({', '.join(gt.BOARDS)}); implies "
                          f"--target grid. The board is canvas-sized, so it also "
                          f"sets the canvas unless --canvas-w-in/-h-in say "
-                         f"otherwise")
+                         f"otherwise. A bigger printed sheet serves a smaller "
+                         f"board as long as it is mounted flush with the "
+                         f"bottom-right canvas corner: name the size you want "
+                         f"to work on, or name the sheet and give --canvas-*-in "
+                         f"to use its overhanging cells too")
+    ap.add_argument("--board-rev", default=None,
+                    help=f"which template revision the printed sheet is: "
+                         f"'auto' (the default - worked out from the ids it "
+                         f"decodes), {gt.TEMPLATE_REV} for a current print, or 1 "
+                         f"for one of the original {'/'.join(gt.legacy_boards())} "
+                         f"sheets, whose ids ran row-major from the top-left. "
+                         f"Same paper, same cells, different ids; a rev 1 sheet "
+                         f"is only its own size. Saved with the calibration, so "
+                         f"it is said once.")
     ap.add_argument("--out", default=None,
                     help="output file for gen-template / grid-probe")
     ap.add_argument("--frame", default=None,
@@ -3768,7 +4297,11 @@ def main():
     ap.add_argument("--ppm", type=float, default=4.0,
                     help="pixels per mm for gen-template (default 4.0)")
     ap.add_argument("--adjust", default=OVERLAY_ADJUST_FILE,
-                    help="file for saved overlay adjustment parameters (.npz)")
+                    help=f"file overlay loads and saves its manual adjustment "
+                         f"in (offset, scale, rotation, opacity); default "
+                         f"{OVERLAY_ADJUST_FILE}. 'none' starts from no "
+                         f"adjustment and saves nothing - use it whenever the "
+                         f"point is to check the calibration itself")
     ap.add_argument("--fit", choices=["consensus", "corners"], default=None,
                     help=f"how to fit the homography (default {FIT_MODE}): "
                          f"'consensus' = one quad fitted to all six squares, "
@@ -3810,6 +4343,11 @@ def main():
         TARGET_EXPLICIT = True
         if args.target == "grid" or (args.board and args.target != "squares"):
             use_grid_target(args.board)
+    if args.board_rev is not None:
+        # before load_calibration, like every other setting the file can supply:
+        # given on the command line, it wins
+        set_board_rev(args.board_rev)
+        BOARD_REV_EXPLICIT = True
     if args.grid_anchor_x is not None:
         GRID_ANCHOR_X_MM, GRID_ANCHOR_EXPLICIT = args.grid_anchor_x, True
     if args.grid_anchor_y is not None:
@@ -3822,9 +4360,18 @@ def main():
     # only announce itself as a signature mismatch, several steps too late.
     # It also carries the lens distortion tuned last time, so recalibrating
     # does not throw the lens settings away.
-    if args.mode in ("calibrate", "run", "overlay"):
+    # gen-template is in this list for one reason: the template is the check of
+    # the whole chain, and a template drawn with a different mounting offset
+    # than the calibration was fitted with is a check that cannot pass. It used
+    # to default the anchor to zero and say nothing, which turns a 10 mm
+    # mounting offset into 10 mm of "the overlay does not land".
+    if args.mode in ("calibrate", "run", "overlay", "gen-template"):
         load_calibration()
-    # the grid board IS the canvas, so it sets the canvas size by default
+    require_valid_board_rev()          # once both are known, whatever set them
+    # The grid board is canvas-sized, so it sets the canvas by default. Only by
+    # default: a bigger sheet on a smaller canvas is a supported way to work
+    # (the ids are anchored to the shared bottom-right corner, see gridtarget),
+    # and then --canvas-w-in/-h-in are what say how big the canvas really is.
     if TARGET == "grid" and not (args.canvas_w_in or args.canvas_h_in):
         CANVAS_W, CANVAS_H = gt.board_size_mm(GRID_BOARD)
     if args.canvas_w_in:

@@ -109,6 +109,28 @@ def rasterize_board(board, ppm, pdf=None):
     return _SHEET_CACHE[key]
 
 
+TRUE_LENS = None                   # (k3, p1, p2, cx, cy) of the rendered lens,
+                                   # cx/cy in units of f = max(w,h); see --lens
+
+
+def true_lens_maps(k1, k2, w, h):
+    """Where each RAW pixel's content sits on the ideal image, per TRUE_LENS.
+
+    Deliberately not ap.undistort_points(): that reads the module's own lens
+    state, which is the thing under test here. A test whose ground truth is
+    produced by the estimator cannot catch the estimator being wrong."""
+    k3, p1, p2, cx, cy = TRUE_LENS or (0.0, 0.0, 0.0, 0.0, 0.0)
+    f = float(max(w, h))
+    K = np.array([[f, 0.0, w / 2.0 + cx * f],
+                  [0.0, f, h / 2.0 + cy * f],
+                  [0.0, 0.0, 1.0]])
+    D = np.array([k1, k2, p1, p2, k3])
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    pts = np.stack([xx.ravel(), yy.ravel()], 1).reshape(-1, 1, 2)
+    p = cv2.undistortPoints(pts, K, D, P=K).reshape(h, w, 2)
+    return p[:, :, 0].copy(), p[:, :, 1].copy()
+
+
 def render_grid_scene(H_true, k1, k2, w, h, ppm=8.0, blur=1.2, noise=2.0,
                       paper=232, ink=28, seed=0, board=None):
     """A camera frame of the printed grid, warped by H_true and distorted."""
@@ -140,12 +162,10 @@ def render_grid_scene(H_true, k1, k2, w, h, ppm=8.0, blur=1.2, noise=2.0,
     if noise:
         frame = np.clip(frame + rng.normal(0, noise, frame.shape), 0,
                         255).astype(np.uint8)
-    if k1 or k2:
-        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-        p = ap.undistort_points(np.stack([xx.ravel(), yy.ravel()], 1), k1, k2, w, h)
-        frame = cv2.remap(frame, p[:, 0].reshape(h, w).astype(np.float32),
-                          p[:, 1].reshape(h, w).astype(np.float32),
-                          cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    if k1 or k2 or TRUE_LENS:
+        mx, my = true_lens_maps(k1, k2, w, h)
+        frame = cv2.remap(frame, mx, my, cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
     return frame
 
 
@@ -166,12 +186,19 @@ def aim_homography(w, h, yaw, pitch, roll, dist_mm, aim_mm):
 
 
 def run_one_grid(seed, w=2592, h=1944, k1=-0.19, k2=0.02, dist=None,
-                 verbose=True, blur=1.2, ink=28, noise=2.0):
-    """One grid viewpoint, end to end. Returns (marker-only, refined, info)."""
+                 verbose=True, blur=1.2, ink=28, noise=2.0, fit_lens=False):
+    """One grid viewpoint, end to end. Returns (marker-only, refined, info).
+
+    fit_lens=False hands the pipeline the true k1/k2, which measures the fit of
+    H and nothing else. fit_lens=True makes it earn them from the frame the way
+    'a' does in calibrate, which is the only way the lens MODEL is on trial:
+    with --lens the frame is rendered through a lens the two-parameter model
+    cannot express, and the millimetres that come out are what a real camera
+    costs."""
     rng = np.random.default_rng(seed)
     cell_model = ap.build_grid_cell_model()
     marker_model = ap.build_grid_marker_model()
-    cols, rows, _ = gt.board_spec(ap.GRID_BOARD)
+    cols, rows = gt.board_spec(ap.GRID_BOARD)
 
     yaw = rng.uniform(-35, 35); pitch = rng.uniform(-30, 30)
     roll = rng.uniform(-8, 8)
@@ -185,6 +212,20 @@ def run_one_grid(seed, w=2592, h=1944, k1=-0.19, k2=0.02, dist=None,
                               ink=ink, noise=noise)
 
     # --- the pipeline, as calibrate_grid() runs it ---
+    lens_note = ""
+    if fit_lens:
+        # exactly the 'a' key: detect with no correction at all, fit the lens to
+        # the corners, then carry on with what was fitted
+        ap.set_lens_extras()
+        first, _, _ = ap.detect_grid_cells(frame, 0.0, 0.0)
+        if not first:
+            if verbose:
+                print(f"  seed {seed}: no marker detected (d={d:.0f}mm) - skipped")
+            return None
+        k1, k2, li = ap.fit_lens(first, w, h, 0.0, 0.0)
+        lens_note = (f"  fitted k1={k1:+.3f} k2={k2:+.3f} "
+                     f"{'+full' if li['took'] else 'only'} "
+                     f"({li['r2']:.3f}->{li['r7']:.3f}px)")
     matches, foreign, clipped = ap.detect_grid_cells(frame, k1, k2)
     if not matches:
         if verbose:
@@ -228,7 +269,8 @@ def run_one_grid(seed, w=2592, h=1944, k1=-0.19, k2=0.02, dist=None,
               f"  worst marker {worst:.1f}px"
               + (f"  MIS-ID {wrong}" if wrong else "")
               + (f"  {clipped} clipped" if clipped else "")
-              + (f"  {foreign} foreign" if foreign else ""))
+              + (f"  {foreign} foreign" if foreign else "")
+              + lens_note)
         print(f"      in view: markers {s_mark.max():.3f} -> refined "
               f"{s_ref.max():.3f} mm    whole canvas: {e_mark.max():.3f} -> "
               f"{e_ref.max():.3f} mm")
@@ -380,17 +422,45 @@ def main():
     p.add_argument("--dist", type=float, default=None,
                    help="camera distance in mm; also the width of the frame in "
                         "mm, so 90 is a 3-cell close-up (default: random)")
+    p.add_argument("--lens", default=None,
+                   help="render through a fuller lens: k3,p1,p2,cx,cy with the "
+                        "principal point offset in units of f=max(w,h) "
+                        "(0.0135 is 35 px at 2592). A plausible webcam is "
+                        "'-0.02,0.001,-0.0005,0.0135,-0.0096'. Implies "
+                        "--fit-lens: being told the truth about a lens the "
+                        "model cannot express would test nothing")
+    p.add_argument("--fit-lens", action="store_true",
+                   help="fit the lens from the frame ('a' in calibrate) instead "
+                        "of handing the pipeline the k1/k2 it was rendered with")
+    p.add_argument("--two-param", action="store_true",
+                   help="fit k1/k2 only, as before the full lens model existed - "
+                        "run it against --lens to see what the extra terms buy")
     a = p.parse_args()
+
+    if a.two_param:
+        ap.LENS_FIT_GAIN = -1.0          # no gain can ever be good enough
+    if a.lens:
+        vals = [float(v) for v in a.lens.split(",")]
+        TRUE_LENS_SET = tuple(vals + [0.0] * (5 - len(vals)))
+        globals()["TRUE_LENS"] = TRUE_LENS_SET
+        a.fit_lens = True
 
     if a.target == "grid":
         ap.use_grid_target(a.board)
         ap.CANVAS_W, ap.CANVAS_H = gt.board_size_mm(a.board)
-        cols, rows, _ = gt.board_spec(a.board)
+        cols, rows = gt.board_spec(a.board)
         print(f"scene: templates/grid-{a.board}-full.pdf, rasterised - "
               f"{cols}x{rows} cells of {gt.CELL_MM} mm, {gt.MARKER_MM} mm "
               f"markers, {gt.LINE_MM} mm lines (blur {a.blur} px, ink {a.ink})")
+        print(f"lens : k1={a.k1:+.3f} k2={a.k2:+.3f}"
+              + (f" k3={TRUE_LENS[0]:+.4f} p1={TRUE_LENS[1]:+.5f} "
+                 f"p2={TRUE_LENS[2]:+.5f} principal point "
+                 f"{TRUE_LENS[3] * 2592:+.0f},{TRUE_LENS[4] * 2592:+.0f}px off centre"
+                 if TRUE_LENS else "")
+              + ("   (fitted from the frame)" if a.fit_lens else "   (given to the fit)"))
         res = [run_one_grid(s, k1=a.k1, k2=a.k2, dist=a.dist, blur=a.blur,
-                            ink=a.ink, noise=a.noise) for s in range(a.n)]
+                            ink=a.ink, noise=a.noise, fit_lens=a.fit_lens)
+               for s in range(a.n)]
         res = [r for r in res if r]
         if not res:
             return

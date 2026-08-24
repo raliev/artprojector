@@ -54,18 +54,55 @@ line looking for the edge of the ink, and it must never find the marker
 instead. 4.7 mm of blank paper is more than twice that.
 
 The board is anchored to the BOTTOM-RIGHT corner of the canvas, the same corner
-everything else in this project measures from, and it is the same size as the
+everything else in this project measures from, and it is at most the size of the
 canvas - so the printed border IS the canvas edge and there is nothing to
 measure with a ruler.
+
+ONE BOARD, MANY CANVAS SIZES
+----------------------------
+An id says where its cell is relative to that bottom-right corner and nothing
+else, so every board is the bottom-right corner of every bigger board, markers
+and all. A printed 16x20 mounted flush IS a 12x16, an 11x14, an 8x10 or a 4x4 -
+the extra rows and columns simply hang off the edge of the smaller canvas - and
+a printed 20x16 does the same for the landscape sizes. Two sheets cover the lot.
+
+Two ways to use a big board on a small canvas, and they are not the same:
+
+  * `--board 14x11` on a printed 16x12: the software only looks at the 14x11
+    corner. Simple, and the canvas size comes out right on its own; the markers
+    outside that corner are counted as foreign and ignored.
+  * `--board 16x12 --canvas-w-in 14 --canvas-h-in 11`: every marker on the
+    sheet is used, including the ones hanging over the edge, which is a wider
+    spread of cells to fit through and therefore a better fit. Name the board
+    you printed, name the canvas you are painting on.
 
 PRINTING
 --------
   python gridtarget.py                    # writes templates/*.pdf
+  python gridtarget.py --boards all       # every size in BOARDS
+  python gridtarget.py --boards 4x4       # one sheet, for a quick test
 
-Full-size PDFs (the page IS 12x16" / 16x20") for a large printer, plus A4 and
+Full-size PDFs (the page IS 16x20" / 20x16") for a large printer, plus A4 and
 Letter tilings for an ordinary one. Print at 100% / "actual size" - NEVER "fit
 to page", which silently scales everything by ~6% and quietly ruins every
 millimetre this project reports. Each tile carries a 100 mm ruler to check that.
+
+ALREADY PRINTED A BOARD?  Keep it.
+----------------------------------
+The sheets printed before this (template rev 1) number their cells row-major
+from the TOP-LEFT out of a range reserved per board, which is what stopped them
+being interchangeable. Same paper, same cells, same lines, same mounting - only
+the id in each cell differs. So they are still perfectly good boards, at their
+own size, and nothing needs reprinting:
+
+  python artprojector.py calibrate --board 12x16 --board-rev 1
+
+`--board-rev auto`, the default, works it out from the ids it decodes and says
+so; a calibration file made before the revisions existed is taken as rev 1. What
+a rev 1 sheet cannot do is stand in for other sizes - that came with rev 2 and
+needs a rev 2 print. `python gridtarget.py --rev 1 --boards 12x16` reprints the
+original sheet unchanged (as templates/grid-12x16-rev1-*.pdf), for replacing one
+that tore without recalibrating.
 
 The tiling grows from the bottom-right corner of the board: the bottom-right
 sheet is used as it comes out of the printer, and every other sheet is trimmed
@@ -97,17 +134,84 @@ ARUCO_DICT_ID = cv2.aruco.DICT_4X4_1000
 ARUCO_BORDER_BITS = 1
 ARUCO_MODULES = 4 + 2 * ARUCO_BORDER_BITS      # 6x6 modules on the paper
 
-# board name -> (cols, rows, first marker id)
+# --------------------------------------------------------------------------
+#  BOARD SIZES AND MARKER IDS
 #
-# The id ranges are kept apart on purpose. Both boards would otherwise start at
-# id 0 and a 12x16 board photographed while the software is configured for
-# 16x20 would decode into a real - and wrong - cell. With disjoint ranges the
-# ids simply fall outside the configured board and the mistake is visible
-# instead of silent.
-BOARDS = {
-    "12x16": (12, 16, 0),          # ids   0..191
-    "16x20": (16, 20, 500),        # ids 500..819
+#  Every board is a window onto ONE lattice of ids, and the corner the window
+#  is fixed to is the BOTTOM-RIGHT - the corner the canvas is measured from and
+#  the corner the board is mounted by. So an id says how far its cell is from
+#  the right and the bottom edge of the board, and nothing else:
+#
+#      id = ID_STRIDE * (cells up from the bottom) + (cells left of the right)
+#
+#  which is what makes the sizes interchangeable. The bottom-right 14x11 corner
+#  of a 16x12 sheet carries exactly the markers a 14x11 sheet would - the same
+#  ids, and (because artprojector.py places the board by that same corner) the
+#  same world coordinates. One printed 16x20 therefore serves every portrait
+#  size below it and one printed 20x16 every landscape one; a smaller canvas
+#  just leaves the rest of the sheet hanging over the edge, or unused. See
+#  boards_covering() / minimal_boards().
+#
+#  What this gives up is worth stating, because it used to be the whole design:
+#  the ids used to be a disjoint range per board, so a sheet photographed while
+#  the software was configured for another size decoded to ids that were simply
+#  not on the configured board, and the mistake was visible instead of silent.
+#  Most of that survives. Two boards' ids agree only where the two boards agree
+#  GEOMETRICALLY - in the shared bottom-right rectangle, where reading one as
+#  the other is not a mistake but the point - and every cell outside it still
+#  falls off the configured board and is counted as foreign. ID_STRIDE is also
+#  deliberately wider than the widest board, which leaves 12 ids per lattice row
+#  that no sheet ever carries, so a garbled read has a fair chance of landing on
+#  one and being thrown away.
+#
+#  Changing ID_STRIDE or the formula means REPRINTING every board: the ink is
+#  what says which cell it is. Hence TEMPLATE_REV, and hence rev 1 below - a
+#  printed board is a physical object that someone had to find a printer for,
+#  so a new id scheme does not get to invalidate one.
+#
+#  REV 1 was the scheme this started with: ids row-major from the board's
+#  TOP-LEFT, from a base kept apart per board (12x16 -> 0..191,
+#  16x20 -> 500..819). Those two sizes are all that was ever printed that way,
+#  and the two sheets are NOT interchangeable with each other or with anything
+#  else, because an id row-major from the top-left depends on the width of the
+#  board it was printed for. Everything else about the sheet - the cells, the
+#  lines, the 16 mm markers, the mounting - is identical between the revisions;
+#  only which id sits in which cell changed. So a rev 1 sheet stays perfectly
+#  usable, at its own size, by telling the software which revision it is:
+#
+#      python artprojector.py calibrate --board 12x16 --board-rev 1
+#
+#  and `--board-rev auto` (the default) works it out from the ids it decodes.
+#  The revision is stored in the calibration file, so it is asked once.
+# --------------------------------------------------------------------------
+ID_STRIDE = 32                     # ids per lattice row; > the widest board
+N_IDS = 1000                       # what DICT_4X4_1000 holds
+TEMPLATE_REV = 2                   # bumped when the ids or the geometry change
+
+BOARDS = {                         # name (inches) -> (cols, rows) in 1" cells
+    "4x4":   (4, 4),
+    "8x10":  (8, 10),
+    "10x8":  (10, 8),
+    "11x14": (11, 14),
+    "14x11": (14, 11),
+    "12x16": (12, 16),
+    "16x12": (16, 12),
+    "16x20": (16, 20),
+    "20x16": (20, 16),
 }
+
+# The rev 1 sheets, and their id bases. Nothing else was ever printed at rev 1,
+# so nothing else can be read at rev 1.
+LEGACY_BOARDS = {
+    (12, 16): 0,                   # ids   0..191
+    (16, 20): 500,                 # ids 500..819
+}
+
+# Which revision the ink in front of us is. Module state because it is a
+# property of the printed object, like CELL_MM - everything that reads or draws
+# an id needs it, and threading it through every call site would only mean the
+# detector and the PDF writer could disagree about it.
+ID_REV = TEMPLATE_REV
 
 # The clear ring of paper between the marker and the grid lines. Not a setting -
 # a consequence - but worth having by name, because the line-snap search range
@@ -115,8 +219,19 @@ BOARDS = {
 CLEAR_MM = (CELL_MM - MARKER_MM) / 2.0
 
 
+def set_id_rev(rev):
+    """Read and draw ids as printed by template revision `rev`."""
+    global ID_REV
+    rev = int(rev)
+    if rev not in (1, TEMPLATE_REV):
+        raise ValueError(f"unknown template revision {rev}; "
+                         f"known: 1, {TEMPLATE_REV}")
+    ID_REV = rev
+    return ID_REV
+
+
 def board_spec(name):
-    """'16x20' -> (cols, rows, id_base). Also accepts '16x20in', '16 x 20'."""
+    """'16x20' -> (cols, rows). Also accepts '16x20in', '16 x 20', '16x20"'."""
     key = str(name).lower().replace(" ", "").replace("in", "").replace('"', "")
     if key not in BOARDS:
         raise ValueError(f"unknown board {name!r}; known: {', '.join(BOARDS)}")
@@ -124,20 +239,113 @@ def board_spec(name):
 
 
 def board_size_mm(name):
-    cols, rows, _ = board_spec(name)
+    cols, rows = board_spec(name)
     return cols * CELL_MM, rows * CELL_MM
 
 
-def marker_id(col, row, cols, id_base):
-    return id_base + row * cols + col
+def legacy_boards():
+    """The board names that exist at rev 1."""
+    return [n for n, cr in BOARDS.items() if cr in LEGACY_BOARDS]
 
 
-def cell_of_id(mid, cols, rows, id_base):
-    """Marker id -> (col, row), or None if it is not on this board."""
-    i = int(mid) - id_base
-    if i < 0 or i >= cols * rows:
+def _legacy_base(cols, rows):
+    base = LEGACY_BOARDS.get((cols, rows))
+    if base is None:
+        raise ValueError(
+            f"there is no rev 1 board of {cols}x{rows} cells - rev 1 was only "
+            f"ever printed as {', '.join(legacy_boards())}. Print a rev "
+            f"{TEMPLATE_REV} sheet for this size, or use --board-rev "
+            f"{TEMPLATE_REV}.")
+    return base
+
+
+def marker_id(col, row, cols, rows, rev=None):
+    """The id printed in cell (col, row) of a cols x rows board.
+
+    col/row count from the board's TOP-LEFT, because that is the frame the PDF
+    is laid out in. The id counts from the BOTTOM-RIGHT, because that is the
+    corner every board shares - except at rev 1, which counted row-major from
+    the top-left and so tied an id to the width of one board."""
+    if (ID_REV if rev is None else int(rev)) == 1:
+        return _legacy_base(cols, rows) + row * cols + col
+    return ID_STRIDE * (rows - 1 - row) + (cols - 1 - col)
+
+
+def cell_of_id(mid, cols, rows, rev=None):
+    """Marker id -> (col, row) on a cols x rows board, or None if not on it."""
+    i = int(mid)
+    if (ID_REV if rev is None else int(rev)) == 1:
+        i -= _legacy_base(cols, rows)
+        if i < 0 or i >= cols * rows:
+            return None
+        return i % cols, i // cols
+    if i < 0:
         return None
-    return i % cols, i // cols
+    left, up = i % ID_STRIDE, i // ID_STRIDE
+    if left >= cols or up >= rows:
+        return None
+    return cols - 1 - left, rows - 1 - up
+
+
+def board_ids(name, rev=None):
+    """The ids printed on that board. Not a contiguous range at rev 2."""
+    cols, rows = board_spec(name)
+    return {marker_id(c, r, cols, rows, rev)
+            for r in range(rows) for c in range(cols)}
+
+
+def boards_with_id(mid, rev=None):
+    """Which known boards carry that id - for 'those are the 20x16 board'."""
+    use = ID_REV if rev is None else int(rev)
+    names = legacy_boards() if use == 1 else list(BOARDS)
+    return [n for n in names if cell_of_id(mid, *BOARDS[n], rev=use)]
+
+
+def boards_covering(name, rev=None):
+    """The boards that can be printed and used AS a `name` board.
+
+    Any board at least as wide and as tall: mounted bottom-right-flush, its
+    markers over the smaller board's area are that board. `name` is in the
+    list, and the rest is what you may already have on the wall.
+
+    A rev 1 board covers nothing but itself - that is the one thing rev 2
+    changed."""
+    cols, rows = board_spec(name)
+    if (ID_REV if rev is None else int(rev)) == 1:
+        return [n for n, cr in BOARDS.items() if cr == (cols, rows)]
+    return [n for n, (c, r) in BOARDS.items() if c >= cols and r >= rows]
+
+
+def boards_covered_by(name, rev=None):
+    """The sizes a printed `name` board can stand in for, `name` included."""
+    cols, rows = board_spec(name)
+    if (ID_REV if rev is None else int(rev)) == 1:
+        return [n for n, cr in BOARDS.items() if cr == (cols, rows)]
+    return [n for n, (c, r) in BOARDS.items() if c <= cols and r <= rows]
+
+
+def minimal_boards():
+    """The boards nothing else covers. Print these and you have every size."""
+    return [n for n in BOARDS if len(boards_covering(n)) == 1]
+
+
+def _check_boards():
+    """Every board's ids have to fit the dictionary, and the lattice row."""
+    for name, (cols, rows) in BOARDS.items():
+        if cols > ID_STRIDE:
+            raise ValueError(f"board {name} is wider than ID_STRIDE={ID_STRIDE}")
+        top_left = marker_id(0, 0, cols, rows, rev=TEMPLATE_REV)
+        if top_left >= N_IDS:                        # the largest id on it
+            raise ValueError(f"board {name} needs id {top_left}, "
+                             f"the dictionary holds {N_IDS}")
+    for (cols, rows), base in LEGACY_BOARDS.items():
+        if (cols, rows) not in BOARDS.values():
+            raise ValueError(f"rev 1 board {cols}x{rows} is not in BOARDS")
+        if base + cols * rows > N_IDS:
+            raise ValueError(f"rev 1 board {cols}x{rows} runs past {N_IDS}")
+
+
+_check_boards()
 
 
 _DICT = None
@@ -226,14 +434,14 @@ def _draw_marker(c, mm, mid, x0, y0_top, page_h_mm):
             col = run
 
 
-def _draw_board(c, mm, board, ox, oy, page_h_mm, clip=None):
+def _draw_board(c, mm, board, ox, oy, page_h_mm, clip=None, rev=None):
     """Draw the whole board with its top-left corner at page mm (ox, oy).
 
     `clip` is (x0, y0, x1, y1) in page mm, top-down - the region of the page
     that may receive ink. Everything is clipped to it, so a tile is literally
     a window onto the same drawing as the full-size sheet: there is no separate
     'tile geometry' that could disagree with it."""
-    cols, rows, id_base = board_spec(board)
+    cols, rows = board_spec(board)
     bw, bh = cols * CELL_MM, rows * CELL_MM
 
     c.saveState()
@@ -266,7 +474,7 @@ def _draw_board(c, mm, board, ox, oy, page_h_mm, clip=None):
     for row in range(r0, r1 + 1):
         for col in range(c0, c1 + 1):
             mx, my, _, _ = marker_rect_mm(col, row)
-            _draw_marker(c, mm, marker_id(col, row, cols, id_base),
+            _draw_marker(c, mm, marker_id(col, row, cols, rows, rev),
                          ox + mx, oy + my, page_h_mm)
     c.restoreState()
 
@@ -311,7 +519,7 @@ def _cut_line(c, mm, page_h_mm, x0, y0, x1, y1):
     c.restoreState()
 
 
-def write_full_pdf(path, board):
+def write_full_pdf(path, board, rev=None):
     """One page, exactly the size of the board.
 
     The outermost line is centred on the board edge, so the printer clips its
@@ -321,11 +529,14 @@ def write_full_pdf(path, board):
     from reportlab.pdfgen import canvas as rl_canvas
     from reportlab.lib.units import mm
 
-    cols, rows, _ = board_spec(board)
+    cols, rows = board_spec(board)
     bw, bh = cols * CELL_MM, rows * CELL_MM
     c = rl_canvas.Canvas(path, pagesize=(bw * mm, bh * mm))
-    c.setTitle(f"artprojector calibration grid {board}")
-    _draw_board(c, mm, board, 0.0, 0.0, bh)
+    # the only place a full-size sheet can say which revision it is: nothing may
+    # be printed on the board itself, where the line snap would measure it
+    c.setTitle(f"artprojector calibration grid {board} "
+               f"rev{ID_REV if rev is None else int(rev)}")
+    _draw_board(c, mm, board, 0.0, 0.0, bh, rev=rev)
     c.showPage()
     c.save()
     return 1
@@ -355,7 +566,7 @@ def tile_layout(board_w, board_h, page_w, page_h,
 
 
 def write_tiled_pdf(path, board, page, margin=PRINT_MARGIN_MM,
-                    overlap=OVERLAP_MM):
+                    overlap=OVERLAP_MM, rev=None):
     """The board cut into printable sheets, one per page.
 
     Each sheet carries its window of the board placed so that the window's
@@ -368,13 +579,14 @@ def write_tiled_pdf(path, board, page, margin=PRINT_MARGIN_MM,
     from reportlab.pdfgen import canvas as rl_canvas
     from reportlab.lib.units import mm
 
-    cols, rows, _ = board_spec(board)
+    cols, rows = board_spec(board)
     bw, bh = cols * CELL_MM, rows * CELL_MM
     pw_mm, ph_mm = PAGES[page]
     n_x, n_y, tiles = tile_layout(bw, bh, pw_mm, ph_mm, margin, overlap)
 
     c = rl_canvas.Canvas(path, pagesize=(pw_mm * mm, ph_mm * mm))
-    c.setTitle(f"artprojector calibration grid {board} on {page}")
+    c.setTitle(f"artprojector calibration grid {board} "
+               f"rev{ID_REV if rev is None else int(rev)} on {page}")
 
     # bottom-right sheet first, then leftwards and upwards - the order they are
     # meant to be glued in, so "sheet 3 of 6" is also "the third one you place"
@@ -384,7 +596,7 @@ def write_tiled_pdf(path, board, page, margin=PRINT_MARGIN_MM,
             # board origin on the page: the window's top-left goes to (margin, margin)
             ox, oy = margin - bx0, margin - by0
             clip = (margin, margin, pw_mm - margin, ph_mm - margin)
-            _draw_board(c, mm, board, ox, oy, ph_mm, clip)
+            _draw_board(c, mm, board, ox, oy, ph_mm, clip, rev)
 
             if i > 0:              # a neighbour to the right: trim to it
                 _cut_line(c, mm, ph_mm, pw_mm - margin, margin,
@@ -394,14 +606,14 @@ def write_tiled_pdf(path, board, page, margin=PRINT_MARGIN_MM,
                           pw_mm - margin, ph_mm - margin)
 
             _tile_info(c, mm, ph_mm, board, page, i, j, n_x, n_y,
-                       bx0, by0, bx1, by1, bw, bh, margin, overlap)
+                       bx0, by0, bx1, by1, bw, bh, margin, overlap, rev)
             c.showPage()
     c.save()
     return n_x * n_y
 
 
 def _tile_info(c, mm, page_h_mm, board, page, i, j, n_x, n_y,
-               bx0, by0, bx1, by1, bw, bh, margin, overlap):
+               bx0, by0, bx1, by1, bw, bh, margin, overlap, rev=None):
     """Labels, instructions and the scale ruler - only where they cannot show.
 
     Two places qualify. The first is the strip of the board that the next sheet
@@ -411,16 +623,19 @@ def _tile_info(c, mm, page_h_mm, board, page, i, j, n_x, n_y,
     not printed at all - a label inside a live cell would sit in the few
     millimetres the line snap searches through, and it would be measured as if
     it were a printed line."""
-    cols, rows, _ = board_spec(board)
+    cols, rows = board_spec(board)
     # which cells of the board this sheet carries (1-based, for a human)
     c0 = max(1, int(math.floor(bx0 / CELL_MM)) + 1)
     r0 = max(1, int(math.floor(by0 / CELL_MM)) + 1)
     c1 = min(cols, int(math.ceil(bx1 / CELL_MM)))
     r1 = min(rows, int(math.ceil(by1 / CELL_MM)))
     n = j * n_x + i + 1
-    head = f"{board}  {page.upper()}  sheet {n} of {n_x * n_y}"
+    use = ID_REV if rev is None else int(rev)
+    also = [b for b in boards_covered_by(board, use) if b != board]
+    head = f"{board} rev{use}  {page.upper()}  sheet {n} of {n_x * n_y}"
     where = (f"col {i + 1} from the RIGHT, row {j + 1} from the BOTTOM"
-             f"   |   covers cells x {c0}-{c1}, y {r0}-{r1}")
+             f"   |   covers cells x {c0}-{c1}, y {r0}-{r1}"
+             + (f"   |   also serves {', '.join(also)}" if also else ""))
 
     # the strip the left-hand neighbour will cover, in page mm
     strip_x = margin + 1.0
@@ -436,7 +651,17 @@ def _tile_info(c, mm, page_h_mm, board, page, i, j, n_x, n_y,
              "then trim each other sheet along its dashed right/bottom line and glue",
              "it ON TOP of the sheet it overlaps, matching the grid lines.",
              "The finished border is the canvas edge - tape it flush to the canvas."]
-    if top_blank >= 34.0:
+    # How much clear space the block below actually wants: the lines, then the
+    # ruler and its label. Measured rather than guessed, because a block that
+    # does not fit spills onto the board - into the few millimetres around a
+    # printed line that the snap searches through, where it would be measured
+    # as if it were the line.
+    # 6 mm in from the paper edge, then the lines, then the ruler and its label
+    # (the vertical ruler needs only its ticks), and a hair of glyph height.
+    need_top = 6.0 + len(lines) * 4.2 + 10.5 + 2.5
+    need_left = 6.0 + len(lines) * 4.2 + 6.0 + 4.0
+
+    if top_blank >= need_top:
         y = margin + 6.0
         for k, s in enumerate(lines):
             _text(c, mm, page_h_mm, margin + 2.0, y + k * 4.2, s,
@@ -445,7 +670,7 @@ def _tile_info(c, mm, page_h_mm, board, page, i, j, n_x, n_y,
                100.0, vertical=False)
         _text(c, mm, page_h_mm, margin + 2.0, y + len(lines) * 4.2 + 10.5,
               "100 mm - measure it", size=6, gray=0.35)
-    elif left_blank >= 34.0:
+    elif left_blank >= need_left:
         x = margin + 6.0
         for k, s in enumerate(lines):
             _text(c, mm, page_h_mm, x + k * 4.2, page_h_mm - margin - 2.0, s,
@@ -463,11 +688,35 @@ What is here
 `grid-<size>-full.pdf`   one page, exactly <size> inches - for a large printer.
 `grid-<size>-a4.pdf`     the same board cut into A4 sheets.
 `grid-<size>-letter.pdf` the same board cut into Letter sheets.
+`grid-<size>-rev1-*.pdf` the ORIGINAL id scheme, for boards printed before it
+                         changed - see "An older board" at the end.
 
 The board is a 1-inch grid the size of the canvas, with an ArUco marker in every
 cell. The marker says which cell it is, so the software needs only two or three
 cells anywhere in the frame to know both the perspective and where on the canvas
 the camera is looking.
+
+One board fits several canvases
+-------------------------------
+A marker's id says how far its cell is from the board's BOTTOM-RIGHT corner, and
+that is the corner the board is mounted by - so every board is exactly the
+bottom-right part of every bigger board, ids included. Mounted flush, one
+printed 16x20 is also a 12x16, an 11x14, an 8x10 and a 4x4; one printed 20x16 is
+also a 16x12, a 14x11, a 10x8 and a 4x4. The rows and columns beyond the smaller
+canvas hang over its edge, and that is all that happens.
+
+So print the big one once and tell the software which canvas you are on:
+
+    python artprojector.py calibrate --target grid --board 14x11
+
+Or, to get some use out of the markers hanging over the edge - more cells spread
+across the frame is a better fit - name the board you actually printed and the
+canvas separately:
+
+    python artprojector.py calibrate --target grid --board 20x16 \\
+        --canvas-w-in 14 --canvas-h-in 11
+
+Both are correct. The first is easier; the second is slightly more accurate.
 
 Printing
 --------
@@ -538,26 +787,75 @@ Using it
 Aim the camera anywhere on the board, from as close as you like. The window
 shows the markers it recognised, the cell each one is, and how far the fitted
 grid still is from the printed ink ("snap", in mm). Press 'c' to save.
+
+An older board
+--------------
+If you printed a board before the ids moved to the shared bottom-right lattice
+(template rev 1: 12x16 and 16x20 only, numbered row-major from the top-left),
+KEEP IT. Nothing about the paper changed - the cells, the lines, the markers and
+the mounting are identical - so it is still a calibration board:
+
+    python artprojector.py calibrate --board 12x16 --board-rev 1
+
+`--board-rev auto` is the default and works it out from the ids, and the answer
+is stored with the calibration, so in practice it is said once or not at all.
+`grid-probe` prints which revision the ids fit, which is the answer to "this
+board used to work and now everything is foreign".
+
+The one thing a rev 1 sheet cannot do is stand in for a smaller canvas - that is
+what rev 2 bought. For that, print a rev 2 board.
+
+`python gridtarget.py --rev 1 --boards 12x16` regenerates the old sheets
+(`grid-12x16-rev1-*.pdf`), identical to the ones printed before, for replacing a
+damaged sheet of a board already on the wall.
 """
 
 
-def generate_all(outdir="templates", boards=("12x16", "16x20"),
+def board_stem(board, rev=None):
+    """The filename stem for a board's PDFs.
+
+    The current revision keeps the plain name; an older one is spelled out,
+    because two sheets that look identical and decode differently must not be
+    one filename."""
+    use = ID_REV if rev is None else int(rev)
+    return f"grid-{board}" if use == TEMPLATE_REV else f"grid-{board}-rev{use}"
+
+
+def generate_all(outdir="templates", boards=("16x20", "20x16"),
                  pages=("a4", "letter"), margin=PRINT_MARGIN_MM,
-                 overlap=OVERLAP_MM, write_readme=True):
+                 overlap=OVERLAP_MM, write_readme=True, rev=None):
+    """The default is the two boards that between them cover every size.
+
+    Nothing stops you printing a small one - a 4x4 fits on one sheet and is
+    handy for a test - but a printed 16x20 already IS every portrait size in
+    BOARDS and a printed 20x16 every landscape one, so those two are the honest
+    default. See boards_covered_by().
+
+    `rev=1` reprints a sheet from the old id scheme, byte for byte the board
+    that was on the wall before - for replacing a torn one without recalibrating
+    or reprinting the rest."""
+    use = ID_REV if rev is None else int(rev)
     os.makedirs(outdir, exist_ok=True)
     made = []
     for b in boards:
-        cols, rows, base = board_spec(b)
-        p = os.path.join(outdir, f"grid-{b}-full.pdf")
-        write_full_pdf(p, b)
+        cols, rows = board_spec(b)
+        stem = board_stem(b, use)
+        p = os.path.join(outdir, f"{stem}-full.pdf")
+        write_full_pdf(p, b, use)
         made.append((p, 1))
         for pg in pages:
-            p = os.path.join(outdir, f"grid-{b}-{pg}.pdf")
-            n = write_tiled_pdf(p, b, pg, margin, overlap)
+            p = os.path.join(outdir, f"{stem}-{pg}.pdf")
+            n = write_tiled_pdf(p, b, pg, margin, overlap, use)
             made.append((p, n))
-        print(f"[grid] {b}: {cols}x{rows} cells, "
+        ids = board_ids(b, use)
+        also = [n for n in boards_covered_by(b, use) if n != b]
+        print(f"[grid] {b} rev{use}: {cols}x{rows} cells, "
               f"{cols * CELL_MM:.1f}x{rows * CELL_MM:.1f} mm, "
-              f"marker ids {base}..{base + cols * rows - 1}")
+              f"{len(ids)} marker ids in {min(ids)}..{max(ids)}"
+              + (f"\n[grid]   mounted bottom-right-flush it also serves "
+                 f"--board {', '.join(also)}" if also else "")
+              + (f"\n[grid]   rev 1 ids: read it with --board-rev 1"
+                 if use == 1 else ""))
     if write_readme:
         with open(os.path.join(outdir, "README.md"), "w") as f:
             f.write(README)
@@ -567,8 +865,8 @@ def generate_all(outdir="templates", boards=("12x16", "16x20"),
     return made
 
 
-def check(outdir="templates", boards=("12x16", "16x20"),
-          pages=("a4", "letter"), ppm=6.0):
+def check(outdir="templates", boards=("16x20", "20x16"),
+          pages=("a4", "letter"), ppm=6.0, rev=None):
     """Rasterise every tile and read it back with the real detector.
 
     The tiling is the one part of this that is easy to get wrong and hard to
@@ -579,25 +877,49 @@ def check(outdir="templates", boards=("12x16", "16x20"),
     does every marker land where tile_layout() says it does - and it asks them
     of the actual PDF, through the actual detector.
 
+    One detection has to be thrown away, and it is worth knowing why. The
+    printable-area clip slices the markers at the edge of a tile's window in
+    half - they are the ones the neighbouring sheet is glued over, so on the
+    finished board they do not exist - and ArUco reads a sliced marker anyway,
+    sometimes correcting the missing third into a valid id of some other cell.
+    That is a garbled read of ink that is not on the assembled board, so it
+    says nothing about the tiling either way, and a detection whose cell cannot
+    be on this page at all is discarded and counted. (The count is printed. A
+    tiling bug that put a marker on the wrong page would show up there rather
+    than vanish.)
+
     Needs pdftoppm (poppler) and is not part of printing; run it after changing
     the page sizes, the margin or the overlap."""
+    import artprojector as ap
+
+    use = ID_REV if rev is None else int(rev)
+    was = (ID_REV, ap.BOARD_REV_AUTO, ap.BOARD_REV_RESOLVED)
+    try:
+        return _check(outdir, boards, pages, ppm, use, ap)
+    finally:
+        # pinning the revision is this function's business and nobody else's
+        set_id_rev(was[0])
+        ap.BOARD_REV_AUTO, ap.BOARD_REV_RESOLVED = was[1], was[2]
+
+
+def _check(outdir, boards, pages, ppm, use, ap):
     import subprocess
     import tempfile
-    import artprojector as ap
 
     ok = True
     for board in boards:
-        cols, rows, _ = board_spec(board)
+        cols, rows = board_spec(board)
         bw, bh = board_size_mm(board)
         for page in pages:
             pw, ph = PAGES[page]
             n_x, n_y, tiles = tile_layout(bw, bh, pw, ph)
-            pdf = os.path.join(outdir, f"grid-{board}-{page}.pdf")
+            pdf = os.path.join(outdir, f"{board_stem(board, use)}-{page}.pdf")
             with tempfile.TemporaryDirectory() as tmp:
                 subprocess.run(["pdftoppm", "-r", f"{ppm * 25.4:.6f}", "-png",
                                 "-gray", pdf, os.path.join(tmp, "p")], check=True)
                 ap.use_grid_target(board)
-                seen, worst = set(), 0.0
+                ap.set_board_rev(use)     # pinned: this PDF's revision is known
+                seen, worst, dropped = set(), 0.0, 0
                 for j in range(n_y):
                     for i in range(n_x):
                         n = j * n_x + i + 1
@@ -607,22 +929,70 @@ def check(outdir="templates", boards=("12x16", "16x20"),
                             print(f"  {pdf}: page {n} missing"); ok = False; continue
                         bx0, by0, _, _ = tiles[(i, j)]
                         ox, oy = PRINT_MARGIN_MM - bx0, PRINT_MARGIN_MM - by0
+                        clip = (PRINT_MARGIN_MM, PRINT_MARGIN_MM,
+                                pw - PRINT_MARGIN_MM, ph - PRINT_MARGIN_MM)
                         found, _foreign, _clipped = ap.detect_grid_cells(img)
                         for (c, r, q) in found:
-                            seen.add((c, r))
                             x0, y0, x1, y1 = marker_rect_mm(c, r)
                             exp = np.array([[x0 + ox, y0 + oy], [x1 + ox, y0 + oy],
                                             [x1 + ox, y1 + oy], [x0 + ox, y1 + oy]])
-                            worst = max(worst, float(np.abs(q - exp * ppm).max()))
+                            # where this cell's marker would be on this page
+                            px0, py0, px1, py1 = x0 + ox, y0 + oy, x1 + ox, y1 + oy
+                            if (px1 <= clip[0] or py1 <= clip[1]
+                                    or px0 >= clip[2] or py0 >= clip[3]):
+                                dropped += 1          # not on this page at all
+                                continue
+                            seen.add((c, r))
+                            if (px0 < clip[0] or py0 < clip[1]
+                                    or px1 > clip[2] or py1 > clip[3]):
+                                continue              # sliced: its corners are
+                            worst = max(worst,        # the cut's, not the ink's
+                                        float(np.abs(q - exp * ppm).max()))
             missing = {(c, r) for r in range(rows) for c in range(cols)} - seen
             bad = missing or worst / ppm > 0.5
             ok = ok and not bad
-            print(f"  {'FAIL' if bad else 'ok  '} {board:6s} {page:6s} "
+            print(f"  {'FAIL' if bad else 'ok  '} rev{use} {board:6s} {page:6s} "
                   f"{n_x}x{n_y}={n_x * n_y} sheets   "
                   f"cells on some sheet {len(seen)}/{cols * rows}   "
                   f"marker placement within {worst / ppm:.3f} mm"
+                  + (f"   ({dropped} sliced-marker misreads dropped)"
+                     if dropped else "")
                   + (f"   MISSING {sorted(missing)[:6]}" if missing else ""))
     print("[grid] check: " + ("all good" if ok else "PROBLEMS ABOVE"))
+    return ok
+
+
+def check_ids():
+    """The interchangeability claim, checked rather than asserted in a comment.
+
+    For every pair of boards where one covers the other, every cell of the
+    smaller one must carry the SAME id in the bigger one, and sit the same
+    distance from the bottom-right corner. That is the whole promise: print the
+    big board, tell the software the small one, and nothing downstream can
+    tell the difference. This is a property of rev 2 alone - rev 1 tied an id
+    to one board's width - so the revision is named here rather than taken from
+    ID_REV."""
+    ok = True
+    for small, (sc, sr) in BOARDS.items():
+        for big in boards_covering(small, rev=TEMPLATE_REV):
+            bc, br = BOARDS[big]
+            for r in range(sr):
+                for c in range(sc):
+                    mid = marker_id(c, r, sc, sr, rev=TEMPLATE_REV)
+                    # the same cell of the big board: same distance from the
+                    # right edge and from the bottom edge
+                    cell = cell_of_id(mid, bc, br, rev=TEMPLATE_REV)
+                    want = (bc - (sc - c), br - (sr - r))
+                    if cell != want:
+                        print(f"  FAIL id {mid}: cell ({c},{r}) of {small} is "
+                              f"{cell} of {big}, expected {want}")
+                        ok = False
+    # and the guard: an id no board carries must be refused by all of them
+    stray = [i for i in range(N_IDS) if not boards_with_id(i, rev=TEMPLATE_REV)]
+    print(f"  ok   {len(BOARDS)} boards agree on every shared cell at rev "
+          f"{TEMPLATE_REV}; "
+          f"{len(stray)} of {N_IDS} dictionary ids are on no board and are "
+          f"rejected as foreign" if ok else "  FAIL see above")
     return ok
 
 
@@ -630,24 +1000,40 @@ def main():
     ap = argparse.ArgumentParser(
         description="Generate the 1-inch ArUco calibration grids as PDFs")
     ap.add_argument("--out", default="templates", help="output directory")
-    ap.add_argument("--boards", default="12x16,16x20",
-                    help=f"comma separated; known: {','.join(BOARDS)}")
+    ap.add_argument("--boards", default=",".join(minimal_boards()),
+                    help=f"comma separated, or 'all'; known: {','.join(BOARDS)}. "
+                         f"The default ({','.join(minimal_boards())}) is enough "
+                         f"for every size: a board mounted flush with the "
+                         f"bottom-right canvas corner also serves every smaller "
+                         f"size, ids and all")
     ap.add_argument("--pages", default="a4,letter",
                     help=f"comma separated; known: {','.join(PAGES)}")
     ap.add_argument("--margin", type=float, default=PRINT_MARGIN_MM,
                     help="unprintable page border to stay out of, mm")
     ap.add_argument("--overlap", type=float, default=OVERLAP_MM,
                     help="how far a sheet laps over its neighbour, mm")
+    ap.add_argument("--rev", type=int, default=TEMPLATE_REV, choices=(1, TEMPLATE_REV),
+                    help=f"which id scheme to print (default {TEMPLATE_REV}). "
+                         f"1 reproduces the original sheets ({', '.join(legacy_boards())} "
+                         f"only, ids row-major from the top-left, a private range "
+                         f"per board) - for replacing a damaged sheet of a board "
+                         f"already on the wall, which is then read with "
+                         f"--board-rev 1. Files get a -rev1 in the name.")
     ap.add_argument("--check", action="store_true",
                     help="after writing, read every tile back through the "
                          "detector and verify the board is fully covered "
                          "(needs pdftoppm)")
     args = ap.parse_args()
-    boards = [b for b in args.boards.split(",") if b]
+    if args.boards.strip().lower() == "all":
+        boards = legacy_boards() if args.rev == 1 else list(BOARDS)
+    else:
+        boards = [b for b in args.boards.split(",") if b]
     pages = [p for p in args.pages.split(",") if p]
-    generate_all(args.out, boards, pages, args.margin, args.overlap)
+    generate_all(args.out, boards, pages, args.margin, args.overlap, rev=args.rev)
     if args.check:
-        raise SystemExit(0 if check(args.out, boards, pages) else 1)
+        good = check_ids() if args.rev == TEMPLATE_REV else True
+        raise SystemExit(
+            0 if check(args.out, boards, pages, rev=args.rev) and good else 1)
 
 
 if __name__ == "__main__":

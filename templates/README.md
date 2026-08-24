@@ -6,11 +6,35 @@ What is here
 `grid-<size>-full.pdf`   one page, exactly <size> inches - for a large printer.
 `grid-<size>-a4.pdf`     the same board cut into A4 sheets.
 `grid-<size>-letter.pdf` the same board cut into Letter sheets.
+`grid-<size>-rev1-*.pdf` the ORIGINAL id scheme, for boards printed before it
+                         changed - see "An older board" at the end.
 
 The board is a 1-inch grid the size of the canvas, with an ArUco marker in every
 cell. The marker says which cell it is, so the software needs only two or three
 cells anywhere in the frame to know both the perspective and where on the canvas
 the camera is looking.
+
+One board fits several canvases
+-------------------------------
+A marker's id says how far its cell is from the board's BOTTOM-RIGHT corner, and
+that is the corner the board is mounted by - so every board is exactly the
+bottom-right part of every bigger board, ids included. Mounted flush, one
+printed 16x20 is also a 12x16, an 11x14, an 8x10 and a 4x4; one printed 20x16 is
+also a 16x12, a 14x11, a 10x8 and a 4x4. The rows and columns beyond the smaller
+canvas hang over its edge, and that is all that happens.
+
+So print the big one once and tell the software which canvas you are on:
+
+    python artprojector.py calibrate --target grid --board 14x11
+
+Or, to get some use out of the markers hanging over the edge - more cells spread
+across the frame is a better fit - name the board you actually printed and the
+canvas separately:
+
+    python artprojector.py calibrate --target grid --board 20x16 \
+        --canvas-w-in 14 --canvas-h-in 11
+
+Both are correct. The first is easier; the second is slightly more accurate.
 
 Printing
 --------
@@ -79,3 +103,24 @@ Using it
 Aim the camera anywhere on the board, from as close as you like. The window
 shows the markers it recognised, the cell each one is, and how far the fitted
 grid still is from the printed ink ("snap", in mm). Press 'c' to save.
+
+An older board
+--------------
+If you printed a board before the ids moved to the shared bottom-right lattice
+(template rev 1: 12x16 and 16x20 only, numbered row-major from the top-left),
+KEEP IT. Nothing about the paper changed - the cells, the lines, the markers and
+the mounting are identical - so it is still a calibration board:
+
+    python artprojector.py calibrate --board 12x16 --board-rev 1
+
+`--board-rev auto` is the default and works it out from the ids, and the answer
+is stored with the calibration, so in practice it is said once or not at all.
+`grid-probe` prints which revision the ids fit, which is the answer to "this
+board used to work and now everything is foreign".
+
+The one thing a rev 1 sheet cannot do is stand in for a smaller canvas - that is
+what rev 2 bought. For that, print a rev 2 board.
+
+`python gridtarget.py --rev 1 --boards 12x16` regenerates the old sheets
+(`grid-12x16-rev1-*.pdf`), identical to the ones printed before, for replacing a
+damaged sheet of a board already on the wall.

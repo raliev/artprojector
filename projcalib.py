@@ -833,6 +833,11 @@ def main():
     p.add_argument("--target", choices=["squares", "grid"], default=None)
     p.add_argument("--board", default=None,
                    help="printed grid board, as in artprojector.py")
+    p.add_argument("--board-rev", default=None,
+                   help="which template revision the printed sheet is (1, "
+                        f"{ap.gt.TEMPLATE_REV}, or 'auto'), as in "
+                        "artprojector.py. Normally comes from the camera "
+                        "calibration and needs no saying.")
     p.add_argument("--canvas-w-in", type=float, default=None)
     p.add_argument("--canvas-h-in", type=float, default=None)
     p.add_argument("--no-keep-awake", action="store_true")
@@ -850,7 +855,11 @@ def main():
         ap.TARGET_EXPLICIT = True
         if args.target == "grid" or (args.board and args.target != "squares"):
             ap.use_grid_target(args.board)
+    if args.board_rev is not None:
+        ap.set_board_rev(args.board_rev)
+        ap.BOARD_REV_EXPLICIT = True
     H_cam = ap.load_calibration()
+    ap.require_valid_board_rev()
     if H_cam is None:
         print(f"[proj] no {ap.CALIB_FILE} - calibrate the CAMERA first:\n"
               f"       python artprojector.py calibrate --target grid "
@@ -882,7 +891,8 @@ def main():
               f"floor where the markers stop decoding - using {spec['cols']}")
     print(f"[proj] canvas {ap.CANVAS_W:.0f}x{ap.CANVAS_H:.0f} mm; camera "
           f"calibration from {ap.CALIB_FILE} "
-          f"(k1={ap.DIST_K1:+.4f} k2={ap.DIST_K2:+.4f})")
+          f"(k1={ap.DIST_K1:+.4f} k2={ap.DIST_K2:+.4f}"
+          f"{'  ' + ap.lens_hud(ap.CALIB_CAM_W, ap.CALIB_CAM_H) if ap.lens_is_extended() else ''})")
     print("[proj] the camera must not have moved since it was calibrated - "
           "nothing here can tell if it has.\n"
           "       Dim the room, aim the camera at the canvas, and keep the "

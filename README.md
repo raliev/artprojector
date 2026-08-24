@@ -39,22 +39,89 @@ their own.
 ## Calibration target 2 - the 1-inch ArUco grid (`--target grid`)
 
 ```
-python gridtarget.py                  # writes templates/*.pdf
+python gridtarget.py                  # writes templates/*.pdf (16x20 and 20x16)
+python gridtarget.py --boards all     # every size below
 python gridtarget.py --check          # ...and verifies the tiling (needs pdftoppm)
 python artprojector.py calibrate --target grid --board 16x20
 ```
 
-`templates/` gets, for each of 12x16" and 16x20":
+The sizes, in inches, `--board` and `gridtarget.BOARDS`:
+
+| portrait | landscape |
+|---|---|
+| 8x10, 11x14, 12x16, 16x20 | 10x8, 14x11, 16x12, 20x16 |
+
+plus 4x4, which is one sheet and useful for a quick test.
+
+`templates/` gets, for each size:
 
 - `grid-<size>-full.pdf` - one page, exactly that many inches, for a large printer;
 - `grid-<size>-a4.pdf`, `grid-<size>-letter.pdf` - the same board cut into
-  ordinary sheets (4 sheets for 12x16, 6 for 16x20, on either paper).
+  ordinary sheets (1 for 4x4, 4 for 12x16, 6 for 16x20, on either paper).
 
 The board is a 1-inch grid the size of the canvas, with a 16 mm ArUco marker
 (`DICT_4X4_1000`) centred in every cell. Print at 100%, assemble, and mount it -
 see below. `templates/README.md` (written by the generator) has the assembly
 instructions; every tile also carries a 100 mm ruler to catch a print that was
 scaled to fit the page.
+
+### One printed board, several canvas sizes
+
+A marker's id says how far its cell is from the board's **bottom-right** corner,
+and nothing else - and that is the corner the board is mounted by and the corner
+the whole project measures from. So every board *is* the bottom-right part of
+every larger board, ids and world coordinates included. Mounted flush:
+
+- a printed **16x20** is also a 12x16, an 11x14, an 8x10 and a 4x4;
+- a printed **20x16** is also a 16x12, a 14x11, a 10x8 and a 4x4.
+
+Two sheets therefore cover every size, and there are two ways to use one:
+
+```
+# name the canvas: only the cells over it are used, the rest are foreign
+python artprojector.py calibrate --target grid --board 14x11
+
+# name the sheet, then the canvas: the overhanging cells are used too, which
+# spreads the fit over more of the frame and is slightly more accurate
+python artprojector.py calibrate --target grid --board 20x16 \
+    --canvas-w-in 14 --canvas-h-in 11
+```
+
+`calibrate` prints which larger sheet fits, and `grid-probe` says so too when it
+sees ids from beyond the configured board - that is not an error.
+
+`gridtarget.py --check` verifies the claim rather than asserting it: every cell
+of every board must carry the same id, at the same distance from the bottom-right
+corner, in every board that covers it.
+
+### Already printed a board? Keep it (`--board-rev`)
+
+Boards printed before this used template **rev 1**: cells numbered row-major from
+the **top-left**, out of a range reserved per board (`12x16` → 0..191,
+`16x20` → 500..819), which is exactly what stopped them being interchangeable.
+Same paper, same cells, same lines, same mounting - only the id in each cell
+differs. So a rev 1 board is still a perfectly good board **at its own size**:
+
+```
+python artprojector.py calibrate --board 12x16 --board-rev 1
+```
+
+- `--board-rev auto` is the **default**: the revision is worked out from the ids
+  that come out of the first frame with markers in it, and printed. The wrong
+  scheme only ever explains about a third of them, so the vote is not close.
+- The revision is saved in `calibration.npz` (`board_rev`), so it is asked once.
+  A calibration file written before the revisions existed is taken as rev 1,
+  which is what it must have been fitted to.
+- `grid-probe` reports how many ids fit each revision - that is the answer to
+  "this board worked yesterday and now everything is foreign".
+- `python gridtarget.py --rev 1 --boards 12x16` reprints the original sheet
+  unchanged, as `templates/grid-12x16-rev1-*.pdf`, for replacing a torn sheet of
+  a board already on the wall.
+
+What a rev 1 sheet cannot do is stand in for a smaller canvas - that is the thing
+rev 2 bought, and it needs a rev 2 print. Tiles carry `rev1`/`rev2` in their
+header; the full-size PDFs carry it in the PDF title, since nothing may be
+printed on the board itself.
 
 ### Mounting: the one thing the target cannot tell you
 
@@ -99,7 +166,7 @@ converted to an image:
 
 ```
 python artprojector.py gen-template --target grid --board 12x16 --out check.png
-python artprojector.py overlay --target grid --board 12x16 --ref check.png --adjust /tmp/fresh.npz
+python artprojector.py overlay --target grid --board 12x16 --ref check.png --adjust none
 ```
 
 `check.png` is the whole *canvas* with the board drawn where the model says the
@@ -112,8 +179,14 @@ is not a calibration error, and chasing it as one wastes an evening.
 A leftover **`overlay_adjust.npz`** does the same kind of damage from the other
 side: `overlay` loads `dx/dy/sx/sy/theta` at start-up and applies them to every
 reference, so an 8 mm `dy` tuned for an older sheet silently shifts the new one
-by 8 mm. Check it (`python -c "import numpy;d=numpy.load('overlay_adjust.npz');
-print({k:float(d[k]) for k in d.files})"`) or point `--adjust` at a fresh file.
+by 8 mm. `--adjust none` is the answer when the point is to check the
+calibration: nothing is loaded, nothing is saved, and the command means the same
+thing on any machine. (Naming a file that does not exist yet also gives zeros -
+`--adjust /tmp/fresh.npz` used to be the advice here - but only until it exists,
+and only on the machine where it is missing, which is the opposite of
+reproducible.) To see what is in the file rather than bypass it: `python -c
+"import numpy;d=numpy.load('overlay_adjust.npz');print({k:float(d[k]) for k in
+d.files})"`.
 
 ### Why markers and not counted dots or QR
 
@@ -152,10 +225,14 @@ to a line would be measured *as* the line.
 grid really does curve across the frame, and on two or three cells the curve is
 barely visible - which is exactly why it has to be dealt with rather than
 ignored. It is lens distortion, not perspective (perspective keeps straight
-lines straight), so it belongs in `k1`/`k2` and not in `H`: press `a` to fit
-them to the marker corners, `r` to let the line snap keep refining them. Fitting
-a homography to a bent frame without that buries the bend in `H`, where it comes
-back as millimetres somewhere else on the canvas.
+lines straight), so it belongs in the lens model and not in `H`: press `a` to fit
+it to the marker corners, `r` to let the line snap keep refining `k1`/`k2`.
+Fitting a homography to a bent frame without that buries the bend in `H`, where
+it comes back as millimetres somewhere else on the canvas. And a bend the model
+cannot express - a radial field about a principal point that is not the middle of
+the frame - buries itself in `H` the same way while every residual on screen
+still reads perfect, which is why `a` fits the principal point too (see *Lens
+distortion* below).
 
 ### What it is worth
 
@@ -269,10 +346,13 @@ python artprojector.py gen-template         # generate a full-canvas target temp
 
 Common options: `--cam N` (camera index, default 0), `--px-per-mm 2.0` (output
 scale), `--ref FILE|DIR` (reference for overlay; a folder is stepped through
-with the arrow keys), `--target squares|grid` and `--board 12x16|16x20` (which
-printed target; `--board` implies `--target grid` and also sets the canvas size,
-since the board is canvas-sized), `--canvas-w-in 12 --canvas-h-in 16`
-(canvas size), `--adjust FILE.npz` (where overlay saves/loads its adjustment),
+with the arrow keys), `--target squares|grid` and `--board 12x16|20x16|...`
+(which printed target; `--board` implies `--target grid` and also sets the canvas
+size, since the board is canvas-sized - a larger printed sheet serves a smaller
+board, see [above](#one-printed-board-several-canvas-sizes)),
+`--canvas-w-in 12 --canvas-h-in 16`
+(canvas size), `--adjust FILE.npz|none` (where overlay saves/loads its
+adjustment; `none` = no adjustment, nothing saved),
 `--view-max 2000` (render size of the corrected overlay view),
 `--fit consensus|corners` (how the homography is fitted), `--thickness 1.5`
 (how thick the printed target is, in mm - see below), `--k1/--k2` (starting
@@ -410,16 +490,38 @@ much sharpness is costing you.
 
 **Lens distortion.** A wide camera bows straight lines near the frame edges, so
 squares out there are not really quadrilaterals and both the detection and the
-fit suffer. Press `a` to auto-fit the radial coefficients: it solves for the
-`k1`/`k2` that make the target's grid lines straightest, which takes a fraction
-of a second. `1`/`2` and `3`/`4` adjust `k1`/`k2` by hand, `5`/`6` change the
-step, `0` resets. The `line residual` in the HUD is the mean distance from the
-corners to the line they should lie on - minimize it. Detection, the consensus
-quad and the homography all run on the corrected frame, and the coefficients
-are saved into `calibration.npz`, so `run` and `overlay` undistort every frame
-automatically (both the raw and the corrected view). In a synthetic test with
-`k1=-0.12` the correction cut the resulting canvas-corner error from ~13 px to
-~0.5 px.
+fit suffer. Press `a` to auto-fit the lens: it solves for the coefficients that
+make the target's grid lines straightest, which takes a fraction of a second.
+`1`/`2` and `3`/`4` adjust `k1`/`k2` by hand, `5`/`6` change the step, `0`
+resets. The `line residual` in the HUD is the mean distance from the corners to
+the line they should lie on - minimize it. Detection, the consensus quad and the
+homography all run on the corrected frame, and the coefficients are saved into
+`calibration.npz`, so `run` and `overlay` undistort every frame automatically
+(both the raw and the corrected view). In a synthetic test with `k1=-0.12` the
+correction cut the resulting canvas-corner error from ~13 px to ~0.5 px.
+
+*The whole lens, not just `k1`/`k2`.* `a` fits `k1`, `k2`, `k3`, the two
+tangential terms **and the principal point**, and the last of those is the one
+that matters. A wrong focal length costs nothing - the model is a polynomial in
+`r/f`, so pinning `f` to `max(w,h)` is absorbed exactly by rescaling `k1`/`k2` -
+but the optical axis of a cheap module is tens of pixels off the middle of the
+sensor, and correcting a radial field about the wrong centre leaves a residual
+that is not a homography. `H` cannot swallow it, and **nothing in the HUD sees
+it**: over the few cells in view the leftover field is nearly affine, so the fit
+absorbs it locally, the line snap keeps reporting 0.04 mm, and the millimetres
+go wrong somewhere else on the canvas. On the synthetic bench (14x11 board,
+320 mm span, otherwise perfect lens) a principal point 35 px off centre costs
+**1.2 mm over the cells in view** while the snap still reads 0.04 mm; fitting it
+brings that to 0.16 mm. The one number that does react is the straight-line
+residual `a` prints, which is why it prints both the before and the after.
+
+The extra terms are only fitted when the frame can locate them - six cells or
+more, spread across at least 35% of the frame in both directions. A close-up of
+three cells cannot say where the optical axis is, so `a` says so and stays with
+`k1`/`k2`. Given the spread, any improvement in the residual is taken:
+`synthtest.py --fit-lens --lens=...` says demanding a 15% improvement was worse
+in both worlds, including the one where the lens really is two-parameter.
+`--two-param` there reproduces the old behaviour for comparison.
 
 **The thickness of the target** (`[` / `]`, `--thickness`). The target is
 printed on something - paper on cardboard, a mounted print, foam board - so the
@@ -584,7 +686,9 @@ frame. Zoom is folded into the warp rather than applied to the finished image,
 so magnifying resamples the sensor frame directly and does resolve more detail
 (up to the sensor limit), and the contours are re-rasterized thin at every zoom
 level. The adjustment (offset, scale, rotation, opacity) is saved to the
-`--adjust` file and loaded on the next run.
+`--adjust` file by `p` and loaded at start-up on the next run; `i` zeroes it for
+this session. `--adjust none` neither loads nor saves - the reference is then
+placed by the calibration alone, which is what a check of the calibration wants.
 
 The `r` view: in raw mode a square filmed at an angle appears as a trapezoid and
 the reference follows the same perspective; in corrected mode the proportions
@@ -609,6 +713,14 @@ Overlaying this template (`overlay --ref calib_template.png`) lands the contours
 on the real squares, which is a quick way to confirm the calibration and the
 adjustment. It is also a convenient base to draw a reference on with the correct
 proportions.
+
+The **mounting offset comes from `calibration.npz`**, like the board and the
+thickness do, and `gen-template` prints the figure it used. It has to: the
+template is drawn where the board is mounted, and a template drawn flush against
+a board that is mounted 10 mm in fails the check by 10 mm - with the lens, the
+snap and the print scale all lining up as suspects. `--grid-anchor-x/-y`
+override it, but then they have to be the same numbers `calibrate` was given, and
+`overlay` now says so out loud when they are not.
 
 Check the overlay against **this**, not against a reference traced over a photo
 of the sheet by hand: the template is the model itself, so whatever does not
@@ -879,7 +991,7 @@ mounting error goes if it is not.
   image px, on the plane of the ink), the lens distortion `k1`/`k2`, the
   `thickness` of the printed target (applied to `H` on load, which is what puts
   it on the canvas), the canvas size it was made for,
-  which `target` (and `board`) it was fitted to, and `model_sig`, the target
+  which `target` (and `board`, `board_rev`) it was fitted to, and `model_sig`, the target
   geometry itself - change the geometry and `run`/`overlay` will tell you the
   file is stale instead of quietly drifting.
 - `projector.npz` - written by `projcalib.py`: `H_mm_to_proj` (the one to use,
